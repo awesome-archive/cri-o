@@ -142,3 +142,77 @@ function expect_log_failure() {
     # then
     expect_log_failure "custom log level filter does not compile"
 }
+
+@test "reload config should succeed with 'decryption_keys_path'" {
+    # given
+    NEW_OPTION="/etc/crio"
+    OPTION="decryption_keys_path"
+
+    # when
+    replace_config $OPTION $NEW_OPTION
+    reload_crio
+
+    # then
+    expect_log_success $OPTION $NEW_OPTION
+}
+
+@test "reload config should succeed with 'seccomp_profile'" {
+    # given
+    NEW_SECCOMP_PROFILE="$(mktemp --tmpdir seccomp.XXXXXX.json)"
+    echo "{}" > "$NEW_SECCOMP_PROFILE"
+    OPTION="seccomp_profile"
+
+    # when
+    replace_config $OPTION $NEW_SECCOMP_PROFILE
+    reload_crio
+
+    # then
+    expect_log_success $OPTION $NEW_SECCOMP_PROFILE
+}
+
+@test "reload config should fail with invalid 'seccomp_profile'" {
+    # given
+    NEW_SECCOMP_PROFILE=")"
+    OPTION="seccomp_profile"
+
+    # when
+    replace_config $OPTION $NEW_SECCOMP_PROFILE
+    reload_crio
+
+    # then
+    expect_log_failure "unable to reload seccomp_profile"
+}
+
+@test "reload config should succeed with 'apparmor_profile'" {
+    if [[ $(is_apparmor_enabled) -eq 0 ]]; then
+        skip "skip test since AppArmor is not enabled."
+    fi
+
+    # given
+    NEW_APPARMOR_PROFILE="unconfined"
+    OPTION="apparmor_profile"
+
+    # when
+    replace_config $OPTION $NEW_APPARMOR_PROFILE
+    reload_crio
+
+    # then
+    expect_log_success $OPTION $NEW_APPARMOR_PROFILE
+}
+
+@test "reload config should fail with invalid 'apparmor_profile'" {
+    if [[ $(is_apparmor_enabled) -eq 0 ]]; then
+        skip "skip test since AppArmor is not enabled."
+    fi
+
+    # given
+    NEW_APPARMOR_PROFILE=")"
+    OPTION="apparmor_profile"
+
+    # when
+    replace_config $OPTION $NEW_APPARMOR_PROFILE
+    reload_crio
+
+    # then
+    expect_log_failure "unable to reload apparmor_profile"
+}

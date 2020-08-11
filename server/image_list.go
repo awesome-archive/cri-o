@@ -1,13 +1,13 @@
 package server
 
 import (
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
 	"golang.org/x/net/context"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // ListImages lists existing images.
-func (s *Server) ListImages(ctx context.Context, req *pb.ListImagesRequest) (resp *pb.ListImagesResponse, err error) {
+func (s *Server) ListImages(ctx context.Context, req *pb.ListImagesRequest) (*pb.ListImagesResponse, error) {
 	filter := ""
 	reqFilter := req.GetFilter()
 	if reqFilter != nil {
@@ -16,11 +16,11 @@ func (s *Server) ListImages(ctx context.Context, req *pb.ListImagesRequest) (res
 			filter = filterImage.Image
 		}
 	}
-	results, err := s.StorageImageServer().ListImages(s.systemContext, filter)
+	results, err := s.StorageImageServer().ListImages(s.config.SystemContext, filter)
 	if err != nil {
 		return nil, err
 	}
-	resp = &pb.ListImagesResponse{}
+	resp := &pb.ListImagesResponse{}
 	for i := range results {
 		image := ConvertImage(&results[i])
 		resp.Images = append(resp.Images, image)

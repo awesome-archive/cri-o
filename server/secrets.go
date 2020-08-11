@@ -8,10 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cri-o/cri-o/internal/pkg/log"
+	"github.com/cri-o/cri-o/internal/log"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 )
 
 // SecretData info
@@ -23,10 +24,10 @@ type SecretData struct {
 // SaveTo saves secret data to given directory
 func (s SecretData) SaveTo(dir string) error {
 	path := filepath.Join(dir, s.Name)
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil && !os.IsExist(err) {
 		return err
 	}
-	return ioutil.WriteFile(path, s.Data, 0700)
+	return ioutil.WriteFile(path, s.Data, 0o700)
 }
 
 func readAll(root, prefix string) ([]SecretData, error) {
@@ -82,7 +83,7 @@ func readFile(root, name string) ([]SecretData, error) {
 }
 
 // getMountsMap separates the host:container paths
-func getMountsMap(path string) (host, container string, err error) {
+func getMountsMap(path string) (host, container string, _ error) {
 	arr := strings.SplitN(path, ":", 2)
 	if len(arr) == 2 {
 		return arr[0], arr[1], nil
@@ -125,7 +126,7 @@ func secretMounts(ctx context.Context, defaultMountsPaths []string, mountLabel, 
 			return nil, fmt.Errorf("remove container directory failed: %v", err)
 		}
 
-		if err := os.MkdirAll(ctrDirOnHost, 0755); err != nil {
+		if err := os.MkdirAll(ctrDirOnHost, 0o755); err != nil {
 			return nil, fmt.Errorf("making container directory failed: %v", err)
 		}
 
@@ -136,14 +137,14 @@ func secretMounts(ctx context.Context, defaultMountsPaths []string, mountLabel, 
 
 		data, err := getHostSecretData(hostDir)
 		if err != nil {
-			return nil, errors.Wrapf(err, "getting host secret data failed")
+			return nil, errors.Wrap(err, "getting host secret data failed")
 		}
 		for _, s := range data {
 			if err := s.SaveTo(ctrDirOnHost); err != nil {
 				return nil, err
 			}
 		}
-		if err := label.Relabel(ctrDirOnHost, mountLabel, false); err != nil {
+		if err := label.Relabel(ctrDirOnHost, mountLabel, false); err != nil && !errors.Is(err, unix.ENOTSUP) {
 			return nil, err
 		}
 

@@ -8,7 +8,7 @@ import (
 	context "context"
 	oci "github.com/cri-o/cri-o/internal/oci"
 	gomock "github.com/golang/mock/gomock"
-	specs_go "github.com/opencontainers/runtime-spec/specs-go"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	io "io"
 	remotecommand "k8s.io/client-go/tools/remotecommand"
 	reflect "reflect"
@@ -53,18 +53,18 @@ func (mr *MockRuntimeImplMockRecorder) AttachContainer(arg0, arg1, arg2, arg3, a
 }
 
 // ContainerStats mocks base method
-func (m *MockRuntimeImpl) ContainerStats(arg0 *oci.Container) (*oci.ContainerStats, error) {
+func (m *MockRuntimeImpl) ContainerStats(arg0 *oci.Container, arg1 string) (*oci.ContainerStats, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ContainerStats", arg0)
+	ret := m.ctrl.Call(m, "ContainerStats", arg0, arg1)
 	ret0, _ := ret[0].(*oci.ContainerStats)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // ContainerStats indicates an expected call of ContainerStats
-func (mr *MockRuntimeImplMockRecorder) ContainerStats(arg0 interface{}) *gomock.Call {
+func (mr *MockRuntimeImplMockRecorder) ContainerStats(arg0, arg1 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ContainerStats", reflect.TypeOf((*MockRuntimeImpl)(nil).ContainerStats), arg0)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ContainerStats", reflect.TypeOf((*MockRuntimeImpl)(nil).ContainerStats), arg0, arg1)
 }
 
 // CreateContainer mocks base method
@@ -139,17 +139,17 @@ func (mr *MockRuntimeImplMockRecorder) PauseContainer(arg0 interface{}) *gomock.
 }
 
 // PortForwardContainer mocks base method
-func (m *MockRuntimeImpl) PortForwardContainer(arg0 *oci.Container, arg1 int32, arg2 io.ReadWriter) error {
+func (m *MockRuntimeImpl) PortForwardContainer(arg0 context.Context, arg1 *oci.Container, arg2 string, arg3 int32, arg4 io.ReadWriteCloser) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "PortForwardContainer", arg0, arg1, arg2)
+	ret := m.ctrl.Call(m, "PortForwardContainer", arg0, arg1, arg2, arg3, arg4)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // PortForwardContainer indicates an expected call of PortForwardContainer
-func (mr *MockRuntimeImplMockRecorder) PortForwardContainer(arg0, arg1, arg2 interface{}) *gomock.Call {
+func (mr *MockRuntimeImplMockRecorder) PortForwardContainer(arg0, arg1, arg2, arg3, arg4 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PortForwardContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).PortForwardContainer), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PortForwardContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).PortForwardContainer), arg0, arg1, arg2, arg3, arg4)
 }
 
 // ReopenContainerLog mocks base method
@@ -223,7 +223,7 @@ func (mr *MockRuntimeImplMockRecorder) UnpauseContainer(arg0 interface{}) *gomoc
 }
 
 // UpdateContainer mocks base method
-func (m *MockRuntimeImpl) UpdateContainer(arg0 *oci.Container, arg1 *specs_go.LinuxResources) error {
+func (m *MockRuntimeImpl) UpdateContainer(arg0 *oci.Container, arg1 *specs.LinuxResources) error {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "UpdateContainer", arg0, arg1)
 	ret0, _ := ret[0].(error)

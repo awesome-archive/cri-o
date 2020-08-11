@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/containers/image/v5/types"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -40,15 +40,18 @@ var _ = t.Describe("ImagePull", func() {
 					Return(nil, nil),
 				imageServerMock.EXPECT().ImageStatus(
 					gomock.Any(), gomock.Any()).
-					Return(&storage.ImageResult{ID: "image",
-						RepoDigests: []string{"digest"}}, nil),
+					Return(&storage.ImageResult{
+						ID:          "image",
+						RepoDigests: []string{"digest"},
+					}, nil),
 				imageCloserMock.EXPECT().Close().Return(nil),
 			)
 
 			// When
 			response, err := sut.PullImage(context.Background(),
 				&pb.PullImageRequest{Image: &pb.ImageSpec{
-					Image: "id"}})
+					Image: "id",
+				}})
 
 			// Then
 			Expect(err).To(BeNil())
@@ -65,14 +68,18 @@ var _ = t.Describe("ImagePull", func() {
 					gomock.Any()).Return(imageCloserMock, nil),
 				imageServerMock.EXPECT().ImageStatus(
 					gomock.Any(), gomock.Any()).
-					Return(&storage.ImageResult{ID: "image",
-						ConfigDigest: digest.Digest("digest")}, nil),
+					Return(&storage.ImageResult{
+						ID:           "image",
+						ConfigDigest: digest.Digest("digest"),
+					}, nil),
 				imageCloserMock.EXPECT().ConfigInfo().
 					Return(types.BlobInfo{Digest: digest.Digest("digest")}),
 				imageServerMock.EXPECT().ImageStatus(
 					gomock.Any(), gomock.Any()).
-					Return(&storage.ImageResult{ID: "image",
-						RepoDigests: []string{"digest"}}, nil),
+					Return(&storage.ImageResult{
+						ID:          "image",
+						RepoDigests: []string{"digest"},
+					}, nil),
 				imageCloserMock.EXPECT().Close().Return(nil),
 			)
 
@@ -130,7 +137,7 @@ var _ = t.Describe("ImagePull", func() {
 			Expect(response).To(BeNil())
 		})
 
-		It("should fail credential decode erros", func() {
+		It("should fail credential decode errors", func() {
 			// Given
 			// When
 			response, err := sut.PullImage(context.Background(),
@@ -146,7 +153,7 @@ var _ = t.Describe("ImagePull", func() {
 			Expect(response).To(BeNil())
 		})
 
-		It("should fail when image pull erros", func() {
+		It("should fail when image pull errors", func() {
 			// Given
 			gomock.InOrder(
 				imageServerMock.EXPECT().ResolveNames(
@@ -168,7 +175,8 @@ var _ = t.Describe("ImagePull", func() {
 			// When
 			response, err := sut.PullImage(context.Background(),
 				&pb.PullImageRequest{Image: &pb.ImageSpec{
-					Image: "id"}})
+					Image: "id",
+				}})
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -188,7 +196,8 @@ var _ = t.Describe("ImagePull", func() {
 			// When
 			response, err := sut.PullImage(context.Background(),
 				&pb.PullImageRequest{Image: &pb.ImageSpec{
-					Image: "id"}})
+					Image: "id",
+				}})
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -210,6 +219,5 @@ var _ = t.Describe("ImagePull", func() {
 			Expect(err).NotTo(BeNil())
 			Expect(response).To(BeNil())
 		})
-
 	})
 })

@@ -3,14 +3,14 @@ package server
 import (
 	"fmt"
 
-	"github.com/cri-o/cri-o/internal/pkg/log"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/internal/storage"
 	"golang.org/x/net/context"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // RemoveImage removes the image.
-func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (resp *pb.RemoveImageResponse, err error) {
+func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (*pb.RemoveImageResponse, error) {
 	image := ""
 	img := req.GetImage()
 	if img != nil {
@@ -19,11 +19,8 @@ func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (r
 	if image == "" {
 		return nil, fmt.Errorf("no image specified")
 	}
-	var (
-		images  []string
-		deleted bool
-	)
-	images, err = s.StorageImageServer().ResolveNames(s.systemContext, image)
+	var deleted bool
+	images, err := s.StorageImageServer().ResolveNames(s.config.SystemContext, image)
 	if err != nil {
 		if err == storage.ErrCannotParseImageID {
 			images = append(images, image)
@@ -32,7 +29,7 @@ func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (r
 		}
 	}
 	for _, img := range images {
-		err = s.StorageImageServer().UntagImage(s.systemContext, img)
+		err = s.StorageImageServer().UntagImage(s.config.SystemContext, img)
 		if err != nil {
 			log.Debugf(ctx, "error deleting image %s: %v", img, err)
 			continue
@@ -43,6 +40,5 @@ func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (r
 	if !deleted && err != nil {
 		return nil, err
 	}
-	resp = &pb.RemoveImageResponse{}
-	return resp, nil
+	return &pb.RemoveImageResponse{}, nil
 }

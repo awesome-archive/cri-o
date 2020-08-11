@@ -12,6 +12,8 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
+const systemdCgroupManager = "systemd"
+
 func TestGetInfo(t *testing.T) {
 	c, err := config.DefaultConfig()
 	if err != nil {
@@ -19,11 +21,11 @@ func TestGetInfo(t *testing.T) {
 	}
 	c.RootConfig.Storage = "afoobarstorage"
 	c.RootConfig.Root = "afoobarroot"
-	c.RuntimeConfig.CgroupManager = "systemd"
+	c.RuntimeConfig.CgroupManagerName = systemdCgroupManager
 	c.APIConfig = config.APIConfig{}
 	s := &Server{config: *c}
 	ci := s.getInfo()
-	if ci.CgroupDriver != "systemd" {
+	if ci.CgroupDriver != systemdCgroupManager {
 		t.Fatalf("expected 'systemd', got %q", ci.CgroupDriver)
 	}
 	if ci.StorageDriver != "afoobarstorage" {
@@ -47,7 +49,7 @@ func TestGetContainerInfo(t *testing.T) {
 		"io.kubernetes.test1": "value1",
 	}
 	getContainerFunc := func(id string) *oci.Container {
-		container, err := oci.NewContainer("testid", "testname", "", "/container/logs", "", labels, annotations, annotations, "image", "imageName", "imageRef", &runtime.ContainerMetadata{}, "testsandboxid", false, false, false, false, "", "/root/for/container", created, "SIGKILL")
+		container, err := oci.NewContainer("testid", "testname", "", "/container/logs", labels, annotations, annotations, "image", "imageName", "imageRef", &runtime.ContainerMetadata{}, "testsandboxid", false, false, false, "", "/root/for/container", created, "SIGKILL")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,7 +166,7 @@ func TestGetContainerInfoCtrStateNil(t *testing.T) {
 	labels := map[string]string{}
 	annotations := map[string]string{}
 	getContainerFunc := func(id string) *oci.Container {
-		container, err := oci.NewContainer("testid", "testname", "", "/container/logs", "", labels, annotations, annotations, "imageName", "imageName", "imageRef", &runtime.ContainerMetadata{}, "testsandboxid", false, false, false, false, "", "/root/for/container", created, "SIGKILL")
+		container, err := oci.NewContainer("testid", "testname", "", "/container/logs", labels, annotations, annotations, "imageName", "imageName", "imageRef", &runtime.ContainerMetadata{}, "testsandboxid", false, false, false, "", "/root/for/container", created, "SIGKILL")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -195,7 +197,7 @@ func TestGetContainerInfoSandboxNotFound(t *testing.T) {
 	labels := map[string]string{}
 	annotations := map[string]string{}
 	getContainerFunc := func(id string) *oci.Container {
-		container, err := oci.NewContainer("testid", "testname", "", "/container/logs", "", labels, annotations, annotations, "imageName", "imageName", "imageRef", &runtime.ContainerMetadata{}, "testsandboxid", false, false, false, false, "", "/root/for/container", created, "SIGKILL")
+		container, err := oci.NewContainer("testid", "testname", "", "/container/logs", labels, annotations, annotations, "imageName", "imageName", "imageRef", &runtime.ContainerMetadata{}, "testsandboxid", false, false, false, "", "/root/for/container", created, "SIGKILL")
 		if err != nil {
 			t.Fatal(err)
 		}

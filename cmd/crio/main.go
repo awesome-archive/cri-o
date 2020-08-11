@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	goflag "flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,12 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/image/v5/types"
 	_ "github.com/containers/libpod/pkg/hooks/0.1.0"
+	"github.com/containers/storage/pkg/ioutils"
 	"github.com/containers/storage/pkg/reexec"
-	"github.com/cri-o/cri-o/internal/pkg/criocli"
-	"github.com/cri-o/cri-o/internal/pkg/log"
-	"github.com/cri-o/cri-o/internal/pkg/signals"
+	"github.com/cri-o/cri-o/internal/criocli"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/internal/signals"
 	"github.com/cri-o/cri-o/internal/version"
 	libconfig "github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/cri-o/server"
@@ -30,14 +31,14 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/klog/v2"
 )
 
-// gitCommit is the commit that the binary is being built from.
-// It will be populated by the Makefile.
-var gitCommit = ""
-
 func writeCrioGoroutineStacks() {
-	path := filepath.Join("/tmp", fmt.Sprintf("crio-goroutine-stacks-%s.log", strings.Replace(time.Now().Format(time.RFC3339), ":", "", -1))) // nolint: gocritic
+	path := filepath.Join("/tmp", fmt.Sprintf(
+		"crio-goroutine-stacks-%s.log",
+		strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""),
+	))
 	if err := utils.WriteGoroutineStacksToFile(path); err != nil {
 		logrus.Warnf("Failed to write goroutine stacks: %s", err)
 	}
@@ -95,11 +96,12 @@ scope of the CRI.
 6. Resource isolation as required by the CRI.`
 
 func main() {
-	// https://github.com/kubernetes/kubernetes/issues/17162
-	if err := goflag.CommandLine.Parse([]string{}); err != nil {
-		fmt.Fprintf(os.Stderr, "unable to parse command line flags\n")
-		os.Exit(-1)
-	}
+	// Configure klog to not write any output
+	klog.LogToStderr(true)
+	klog.SetOutput(ioutil.Discard)
+
+	// This must be done before reexec.Init()
+	ioutils.SetDefaultOptions(ioutils.AtomicFileWriterOptions{NoSync: true})
 
 	if reexec.Init() {
 		fmt.Fprintf(os.Stderr, "unable to initialize container storage\n")
@@ -107,22 +109,15 @@ func main() {
 	}
 	app := cli.NewApp()
 
-	var v []string
-	v = append(v, version.Version)
-	if gitCommit != "" && gitCommit != "unknown" {
-		v = append(v, fmt.Sprintf("commit: %s", gitCommit))
-	}
 	app.Name = "crio"
 	app.Usage = "OCI-based implementation of Kubernetes Container Runtime Interface"
 	app.Authors = []*cli.Author{{Name: "The CRI-O Maintainers"}}
 	app.UsageText = usage
 	app.Description = app.Usage
-	app.Version = strings.Join(v, "\n")
-
-	systemContext := &types.SystemContext{}
+	app.Version = version.Version + "\n" + version.Get().String()
 
 	var err error
-	app.Flags, app.Metadata, err = criocli.GetFlagsAndMetadata(systemContext)
+	app.Flags, app.Metadata, err = criocli.GetFlagsAndMetadata()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -134,13 +129,12 @@ func main() {
 	app.Commands = criocli.DefaultCommands
 	app.Commands = append(app.Commands, []*cli.Command{
 		configCommand,
+		versionCommand,
 		wipeCommand,
 	}...)
 
-	var configPath string
 	app.Before = func(c *cli.Context) (err error) {
-		var config *libconfig.Config
-		configPath, config, err = criocli.GetConfigFromContext(c)
+		config, err := criocli.GetAndMergeConfigFromContext(c)
 		if err != nil {
 			return err
 		}
@@ -166,7 +160,7 @@ func main() {
 		logrus.AddHook(filterHook)
 
 		if path := c.String("log"); path != "" {
-			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_SYNC, 0666)
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_SYNC, 0o666)
 			if err != nil {
 				return err
 			}
@@ -210,7 +204,7 @@ func main() {
 		}
 
 		// Validate the configuration during runtime
-		if err := config.Validate(systemContext, true); err != nil {
+		if err := config.Validate(true); err != nil {
 			cancel()
 			return err
 		}
@@ -230,13 +224,20 @@ func main() {
 			grpc.MaxRecvMsgSize(config.GRPCMaxRecvMsgSize),
 		)
 
-		service, err := server.New(ctx, systemContext, configPath, config)
+		service, err := server.New(ctx, config)
 		if err != nil {
 			logrus.Fatal(err)
 		}
 
-		// Immediately upon start up, write our new version file
-		if err := version.WriteVersionFile(config.VersionFile, gitCommit); err != nil {
+		// Immediately upon start up, write our new version files
+		// we write one to a tmpfs, so we can detect when a node rebooted.
+		// in this sitaution, we want to wipe containers
+		if err := version.WriteVersionFile(config.VersionFile); err != nil {
+			logrus.Fatal(err)
+		}
+		// we then write to a persistent directory. This is to check if crio has upgraded
+		// if it has, we should wipe images
+		if err := version.WriteVersionFile(config.VersionFilePersist); err != nil {
 			logrus.Fatal(err)
 		}
 

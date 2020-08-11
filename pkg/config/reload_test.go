@@ -4,6 +4,7 @@ import (
 	"io/ioutil"
 	"strings"
 
+	"github.com/containers/libpod/pkg/apparmor"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -13,9 +14,10 @@ var _ = t.Describe("Config", func() {
 	BeforeEach(beforeEach)
 
 	t.Describe("Reload", func() {
-		var modifyDefaultConfig = func(old, new string) string {
+		modifyDefaultConfig := func(old, new string) {
 			filePath := t.MustTempFile("config")
 			Expect(sut.ToFile(filePath)).To(BeNil())
+			Expect(sut.UpdateFromFile(filePath)).To(BeNil())
 
 			read, err := ioutil.ReadFile(filePath)
 			Expect(err).To(BeNil())
@@ -23,40 +25,30 @@ var _ = t.Describe("Config", func() {
 			newContents := strings.ReplaceAll(string(read), old, new)
 			err = ioutil.WriteFile(filePath, []byte(newContents), 0)
 			Expect(err).To(BeNil())
-
-			return filePath
 		}
 
 		It("should succeed without any config change", func() {
 			// Given
 			filePath := t.MustTempFile("config")
 			Expect(sut.ToFile(filePath)).To(BeNil())
+			Expect(sut.UpdateFromFile(filePath)).To(BeNil())
 
 			// When
-			err := sut.Reload(filePath)
+			err := sut.Reload()
 
 			// Then
 			Expect(err).To(BeNil())
 		})
 
-		It("should fail with invalid config path", func() {
-			// Given
-			// When
-			err := sut.Reload("")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
-
 		It("should fail with invalid log_level", func() {
 			// Given
-			filePath := modifyDefaultConfig(
-				`log_level = "error"`,
+			modifyDefaultConfig(
+				`log_level = "info"`,
 				`log_level = "invalid"`,
 			)
 
 			// When
-			err := sut.Reload(filePath)
+			err := sut.Reload()
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -64,13 +56,27 @@ var _ = t.Describe("Config", func() {
 
 		It("should fail with invalid pause_image_auth_file", func() {
 			// Given
-			filePath := modifyDefaultConfig(
+			modifyDefaultConfig(
 				`pause_image_auth_file = ""`,
 				`pause_image_auth_file = "`+invalidPath+`"`,
 			)
 
 			// When
-			err := sut.Reload(filePath)
+			err := sut.Reload()
+
+			// Then
+			Expect(err).NotTo(BeNil())
+		})
+
+		It("should fail with invalid seccomp_profile", func() {
+			// Given
+			modifyDefaultConfig(
+				`seccomp_profile = ""`,
+				`seccomp_profile = "`+invalidPath+`"`,
+			)
+
+			// When
+			err := sut.Reload()
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -212,6 +218,111 @@ var _ = t.Describe("Config", func() {
 
 			// Then
 			Expect(err).NotTo(BeNil())
+		})
+	})
+
+	t.Describe("ReloadRegistries", func() {
+		It("should succeed to reload registries", func() {
+			// Given
+			// When
+			err := sut.ReloadRegistries()
+
+			// Then
+			Expect(err).To(BeNil())
+		})
+
+		It("should fail if registries file does not exist", func() {
+			// Given
+			sut.SystemContext.SystemRegistriesConfPath = invalidPath
+
+			// When
+			err := sut.ReloadRegistries()
+
+			// Then
+			Expect(err).NotTo(BeNil())
+		})
+
+		It("should fail if registries file is invalid", func() {
+			// Given
+			regConf := t.MustTempFile("reload-registries")
+			Expect(ioutil.WriteFile(regConf, []byte("invalid"), 0o755)).To(BeNil())
+			sut.SystemContext.SystemRegistriesConfPath = regConf
+
+			// When
+			err := sut.ReloadRegistries()
+
+			// Then
+			Expect(err).NotTo(BeNil())
+		})
+	})
+
+	t.Describe("ReloadSeccompProfile", func() {
+		It("should succeed without any config change", func() {
+			// Given
+			// When
+			err := sut.ReloadSeccompProfile(sut)
+
+			// Then
+			Expect(err).To(BeNil())
+		})
+
+		It("should succeed with config change", func() {
+			// Given
+			filePath := t.MustTempFile("seccomp")
+			Expect(ioutil.WriteFile(filePath, []byte(`{}`), 0o644)).To(BeNil())
+
+			newConfig := defaultConfig()
+			newConfig.SeccompProfile = filePath
+
+			// When
+			err := sut.ReloadSeccompProfile(newConfig)
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(sut.SeccompProfile).To(Equal(filePath))
+		})
+
+		It("should fail with invalid seccomp_profile", func() {
+			// Given
+			newConfig := defaultConfig()
+			newConfig.SeccompProfile = invalidPath
+
+			// When
+			err := sut.ReloadSeccompProfile(newConfig)
+
+			// Then
+			Expect(err).NotTo(BeNil())
+		})
+	})
+
+	t.Describe("ReloadAppArmorProfile", func() {
+		BeforeEach(func() {
+			if !apparmor.IsEnabled() {
+				Skip("AppArmor is disabled")
+			}
+		})
+
+		It("should succeed without any config change", func() {
+			// Given
+			// When
+			err := sut.ReloadAppArmorProfile(sut)
+
+			// Then
+			Expect(err).To(BeNil())
+		})
+
+		It("should succeed with config change", func() {
+			// Given
+			const profile = "unconfined"
+			newConfig := defaultConfig()
+			newConfig.ApparmorProfile = profile
+
+			// When
+			err := sut.ReloadAppArmorProfile(newConfig)
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(sut.ApparmorProfile).To(Equal(profile))
 		})
 	})
 })

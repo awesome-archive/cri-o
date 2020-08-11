@@ -14,20 +14,24 @@ run:
 linters:
   disable-all: true
   enable:
+    - asciicheck
     - bodyclose
     - deadcode
     - depguard
     - dogsled
     - dupl
     - errcheck
+    - exportloopref
     - gochecknoinits
     - goconst
     - gocritic
     - gocyclo
     - gofmt
+    - gofumpt
+    - goheader
     - goimports
     - golint
-    - gosec
+    - goprintffuncname
     - gosimple
     - govet
     - ineffassign
@@ -35,8 +39,11 @@ linters:
     - maligned
     - misspell
     - nakedret
+    - nolintlint
     - prealloc
+    - rowserrcheck
     - scopelint
+    - sqlclosecheck
     - staticcheck
     - structcheck
     - stylecheck
@@ -46,11 +53,22 @@ linters:
     - unused
     - varcheck
     - whitespace
+    # - exhaustive
     # - funlen
+    # - gci
     # - gochecknoglobals
     # - gocognit
+    # - godot
     # - godox
+    # - goerr113
+    # - gomnd
+    # - gomodguard
+    # - gosec
     # - lll
+    # - nestif
+    # - nlreturn
+    # - noctx
+    # - testpackage
     # - wsl
 linters-settings:
   errcheck:

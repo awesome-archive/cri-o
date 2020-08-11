@@ -5,9 +5,9 @@ import (
 
 	"github.com/containers/storage"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
-	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/log"
-	pkgstorage "github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/log"
+	oci "github.com/cri-o/cri-o/internal/oci"
+	pkgstorage "github.com/cri-o/cri-o/internal/storage"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
@@ -15,7 +15,8 @@ import (
 
 // RemovePodSandbox deletes the sandbox. If there are any running containers in the
 // sandbox, they should be force deleted.
-func (s *Server) RemovePodSandbox(ctx context.Context, req *pb.RemovePodSandboxRequest) (resp *pb.RemovePodSandboxResponse, err error) {
+func (s *Server) RemovePodSandbox(ctx context.Context, req *pb.RemovePodSandboxRequest) (*pb.RemovePodSandboxResponse, error) {
+	log.Infof(ctx, "Removing pod sandbox: %s", req.GetPodSandboxId())
 	sb, err := s.getPodSandboxFromRequest(req.PodSandboxId)
 	if err != nil {
 		if err == sandbox.ErrIDEmpty {
@@ -25,15 +26,15 @@ func (s *Server) RemovePodSandbox(ctx context.Context, req *pb.RemovePodSandboxR
 		// If the sandbox isn't found we just return an empty response to adhere
 		// the CRI interface which expects to not error out in not found
 		// cases.
-
-		resp = &pb.RemovePodSandboxResponse{}
 		log.Warnf(ctx, "could not get sandbox %s, it's probably been removed already: %v", req.PodSandboxId, err)
-		return resp, nil
+		return &pb.RemovePodSandboxResponse{}, nil
 	}
 
 	podInfraContainer := sb.InfraContainer()
 	containers := sb.Containers().List()
-	containers = append(containers, podInfraContainer)
+	if podInfraContainer != nil {
+		containers = append(containers, podInfraContainer)
+	}
 
 	// Delete all the containers in the sandbox
 	for _, c := range containers {
@@ -74,23 +75,35 @@ func (s *Server) RemovePodSandbox(ctx context.Context, req *pb.RemovePodSandboxR
 		if err := s.CtrIDIndex().Delete(c.ID()); err != nil {
 			return nil, fmt.Errorf("failed to delete container %s in pod sandbox %s from index: %v", c.Name(), sb.ID(), err)
 		}
-		s.StopMonitoringConmon(c)
 	}
 
-	s.removeInfraContainer(podInfraContainer)
-	podInfraContainer.CleanupConmonCgroup()
+	if podInfraContainer != nil {
+		s.removeInfraContainer(podInfraContainer)
+		podInfraContainer.CleanupConmonCgroup()
 
-	// Remove the files related to the sandbox
-	if err := s.StorageRuntimeServer().StopContainer(sb.ID()); err != nil && errors.Cause(err) != storage.ErrContainerUnknown {
-		log.Warnf(ctx, "failed to stop sandbox container in pod sandbox %s: %v", sb.ID(), err)
+		if err := s.StorageRuntimeServer().StopContainer(sb.ID()); err != nil && !errors.Is(err, storage.ErrContainerUnknown) {
+			log.Warnf(ctx, "failed to stop sandbox container in pod sandbox %s: %v", sb.ID(), err)
+		}
 	}
+
+	if err := sb.UnmountShm(); err != nil {
+		return nil, errors.Wrap(err, "unable to unmount SHM")
+	}
+
 	if err := s.StorageRuntimeServer().RemovePodSandbox(sb.ID()); err != nil && err != pkgstorage.ErrInvalidSandboxID {
 		return nil, fmt.Errorf("failed to remove pod sandbox %s: %v", sb.ID(), err)
 	}
+	if s.config.ManageNSLifecycle {
+		if err := sb.RemoveManagedNamespaces(); err != nil {
+			return nil, errors.Wrap(err, "unable to remove managed namespaces")
+		}
+	}
 
-	s.ReleaseContainerName(podInfraContainer.Name())
-	if err := s.CtrIDIndex().Delete(podInfraContainer.ID()); err != nil {
-		return nil, fmt.Errorf("failed to delete infra container %s in pod sandbox %s from index: %v", podInfraContainer.ID(), sb.ID(), err)
+	if podInfraContainer != nil {
+		s.ReleaseContainerName(podInfraContainer.Name())
+		if err := s.CtrIDIndex().Delete(podInfraContainer.ID()); err != nil {
+			return nil, fmt.Errorf("failed to delete infra container %s in pod sandbox %s from index: %v", podInfraContainer.ID(), sb.ID(), err)
+		}
 	}
 
 	s.ReleasePodName(sb.Name())
@@ -101,7 +114,6 @@ func (s *Server) RemovePodSandbox(ctx context.Context, req *pb.RemovePodSandboxR
 		return nil, fmt.Errorf("failed to delete pod sandbox %s from index: %v", sb.ID(), err)
 	}
 
-	log.Infof(ctx, "removed pod sandbox with infra container: %s", podInfraContainer.Description())
-	resp = &pb.RemovePodSandboxResponse{}
-	return resp, nil
+	log.Infof(ctx, "Removed pod sandbox: %s", sb.ID())
+	return &pb.RemovePodSandboxResponse{}, nil
 }

@@ -90,7 +90,7 @@ var _ = BeforeSuite(func() {
 		},
 		"linux": {
 			"namespaces": [
-				{"type": "network", "path": "default"}
+				{"type": "network", "path": "/proc/self/ns/net"}
 			]
 		},
 		"process": {
@@ -134,7 +134,7 @@ func beforeEach() {
 	)
 
 	// Setup the sut
-	sut, err = lib.New(context.Background(), nil, libMock)
+	sut, err = lib.New(context.Background(), libMock)
 	Expect(err).To(BeNil())
 	Expect(sut).NotTo(BeNil())
 
@@ -142,13 +142,13 @@ func beforeEach() {
 	mySandbox, err = sandbox.New(sandboxID, "", "", "", "",
 		make(map[string]string), make(map[string]string), "", "",
 		&pb.PodSandboxMetadata{}, "", "", false, "", "", "",
-		[]*hostport.PortMapping{}, false)
+		[]*hostport.PortMapping{}, false, time.Now())
 	Expect(err).To(BeNil())
 
-	myContainer, err = oci.NewContainer(containerID, "", "", "", "",
+	myContainer, err = oci.NewContainer(containerID, "", "", "",
 		make(map[string]string), make(map[string]string),
 		make(map[string]string), "", "", "",
-		&pb.ContainerMetadata{}, sandboxID, false, false,
+		&pb.ContainerMetadata{}, sandboxID, false,
 		false, false, "", "", time.Now(), "")
 	Expect(err).To(BeNil())
 }
@@ -173,5 +173,5 @@ func addContainerAndSandbox() {
 }
 
 func createDummyState() {
-	Expect(ioutil.WriteFile("state.json", []byte("{}"), 0644)).To(BeNil())
+	Expect(ioutil.WriteFile("state.json", []byte("{}"), 0o644)).To(BeNil())
 }

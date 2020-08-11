@@ -8,7 +8,7 @@ function setup() {
 
 function teardown() {
 	cleanup_test
-	rm -f /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING/*
+	rm -f /var/lib/cni/networks/$RANDOM_CNI_NETWORK/*
 }
 
 @test "ensure correct hostname" {
@@ -81,12 +81,15 @@ function teardown() {
 	[ "$status" -eq 0  ]
 	ctr_id="$output"
 
-	check_pod_cidr $ctr_id
-
+    run crictl exec --sync $ctr_id ip addr show dev eth0 scope global 2>&1
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ $POD_IPV4_CIDR_START ]]
+    [[ "$output" =~ $POD_IPV6_CIDR_START ]]
 }
 
 @test "Ensure correct CNI plugin namespace/name/container-id arguments" {
-	start_crio "" "" "" "" "prepare_plugin_test_args_network_conf"
+	start_crio "" "prepare_plugin_test_args_network_conf"
 	run crictl runp "$TESTDATA"/sandbox_config.json
 	[ "$status" -eq 0 ]
 
@@ -105,8 +108,7 @@ function teardown() {
 	[ "$status" -eq 0 ]
 	pod_id="$output"
 
-	get_host_ip
-	echo $host_ip
+	host_ip=$(get_host_ip)
 
 	run crictl create "$pod_id" "$TESTDATA"/container_config_hostport.json "$TESTDATA"/sandbox_config_hostport.json
 	echo "$output"
@@ -127,7 +129,7 @@ function teardown() {
 @test "Clean up network if pod sandbox fails" {
 	cp $(which conmon) "$TESTDIR"/conmon
 	CONMON_BINARY="$TESTDIR"/conmon
-	start_crio "" "" "" "" "prepare_plugin_test_args_network_conf"
+	start_crio "" "prepare_plugin_test_args_network_conf"
 
 	# make conmon non-executable to cause the sandbox setup to fail after
 	# networking has been configured
@@ -139,13 +141,13 @@ function teardown() {
 
 	# ensure that the server cleaned up sandbox networking if the sandbox
 	# failed after network setup
-	rm -f /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING/last_reserved_ip*
-	num_allocated=$(ls /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING | grep -v lock | wc -l)
+	rm -f /var/lib/cni/networks/$RANDOM_CNI_NETWORK/last_reserved_ip*
+	num_allocated=$(ls /var/lib/cni/networks/$RANDOM_CNI_NETWORK | grep -v lock | wc -l)
 	[[ "${num_allocated}" == "0" ]]
 }
 
 @test "Clean up network if pod sandbox fails after plugin success" {
-	start_crio "" "" "" "" "prepare_plugin_test_args_network_conf_malformed_result"
+	start_crio "" "prepare_plugin_test_args_network_conf_malformed_result"
 
 	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
@@ -153,7 +155,7 @@ function teardown() {
 
 	# ensure that the server cleaned up sandbox networking if the sandbox
 	# failed during network setup after the CNI plugin itself succeeded
-	rm -f /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING/last_reserved_ip*
-	num_allocated=$(ls /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING | grep -v lock | wc -l)
+	rm -f /var/lib/cni/networks/$RANDOM_CNI_NETWORK/last_reserved_ip*
+	num_allocated=$(ls /var/lib/cni/networks/$RANDOM_CNI_NETWORK | grep -v lock | wc -l)
 	[[ "${num_allocated}" == "0" ]]
 }

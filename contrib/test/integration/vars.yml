@@ -4,7 +4,11 @@
 integration_selinux_enabled: True
 e2e_selinux_enabled: False
 node_e2e_selinux_enabled: False
-manage_network_ns_lifecycle: False
+manage_ns_lifecycle: True
+
+build_runc: True
+build_crun: False
+cgroupv2: False
 
 # For results.yml Paths use rsync 'source' conventions
 artifacts: "/tmp/artifacts"  # Base-directory for collection
@@ -16,7 +20,7 @@ result_dest_basedir: '{{ lookup("env","WORKSPACE") |
 
 # Environment variables to set when executing integration tests
 int_test_env:
-    CGROUP_MANAGER: "cgroupfs"
+    CGROUP_MANAGER: "systemd"
     STORAGE_OPTIONS: >
         --storage-driver=overlay
 

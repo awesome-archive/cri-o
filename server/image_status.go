@@ -6,15 +6,18 @@ import (
 	"strings"
 
 	"github.com/containers/storage"
-	"github.com/cri-o/cri-o/internal/pkg/log"
-	pkgstorage "github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/log"
+	pkgstorage "github.com/cri-o/cri-o/internal/storage"
+	json "github.com/json-iterator/go"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // ImageStatus returns the status of the image.
-func (s *Server) ImageStatus(ctx context.Context, req *pb.ImageStatusRequest) (resp *pb.ImageStatusResponse, err error) {
+func (s *Server) ImageStatus(ctx context.Context, req *pb.ImageStatusRequest) (*pb.ImageStatusResponse, error) {
+	var resp *pb.ImageStatusResponse
 	image := ""
 	img := req.GetImage()
 	if img != nil {
@@ -23,7 +26,9 @@ func (s *Server) ImageStatus(ctx context.Context, req *pb.ImageStatusRequest) (r
 	if image == "" {
 		return nil, fmt.Errorf("no image specified")
 	}
-	images, err := s.StorageImageServer().ResolveNames(s.systemContext, image)
+
+	log.Infof(ctx, "Checking image status: %s", image)
+	images, err := s.StorageImageServer().ResolveNames(s.config.SystemContext, image)
 	if err != nil {
 		if err == pkgstorage.ErrCannotParseImageID {
 			images = append(images, image)
@@ -36,14 +41,14 @@ func (s *Server) ImageStatus(ctx context.Context, req *pb.ImageStatusRequest) (r
 		lastErr  error
 	)
 	for _, image := range images {
-		status, err := s.StorageImageServer().ImageStatus(s.systemContext, image)
+		status, err := s.StorageImageServer().ImageStatus(s.config.SystemContext, image)
 		if err != nil {
 			if errors.Cause(err) == storage.ErrImageUnknown {
-				log.Warnf(ctx, "imageStatus: can't find %s", image)
+				log.Debugf(ctx, "can't find %s", image)
 				notfound = true
 				continue
 			}
-			log.Warnf(ctx, "imageStatus: error getting status from %s: %v", image, err)
+			log.Warnf(ctx, "error getting status from %s: %v", image, err)
 			lastErr = err
 			continue
 		}
@@ -64,6 +69,13 @@ func (s *Server) ImageStatus(ctx context.Context, req *pb.ImageStatusRequest) (r
 				Size_:       size,
 			},
 		}
+		if req.Verbose {
+			info, err := createImageInfo(status)
+			if err != nil {
+				return nil, errors.Wrap(err, "creating image info")
+			}
+			resp.Info = info
+		}
 		uid, username := getUserFromImage(status.User)
 		if uid != nil {
 			resp.Image.Uid = &pb.Int64Value{Value: *uid}
@@ -75,8 +87,11 @@ func (s *Server) ImageStatus(ctx context.Context, req *pb.ImageStatusRequest) (r
 		return nil, lastErr
 	}
 	if notfound && resp == nil {
+		log.Infof(ctx, "Image %s not found", image)
 		return &pb.ImageStatusResponse{}, nil
 	}
+
+	log.Infof(ctx, "Image status: %v", resp)
 	return resp, nil
 }
 
@@ -97,4 +112,19 @@ func getUserFromImage(user string) (id *int64, username string) {
 	}
 	// If user is a numeric uid.
 	return &uid, ""
+}
+
+func createImageInfo(result *pkgstorage.ImageResult) (map[string]string, error) {
+	info := struct {
+		Labels    map[string]string `json:"labels,omitempty"`
+		ImageSpec *specs.Image      `json:"imageSpec"`
+	}{
+		result.Labels,
+		result.OCIConfig,
+	}
+	bytes, err := json.Marshal(info)
+	if err != nil {
+		return nil, errors.Wrapf(err, "marshal data: %v", info)
+	}
+	return map[string]string{"info": string(bytes)}, nil
 }

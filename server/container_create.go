@@ -10,31 +10,27 @@ import (
 	"strings"
 
 	"github.com/containers/storage/pkg/idtools"
+	"github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/stringid"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
-	"github.com/cri-o/cri-o/internal/pkg/log"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/cri-o/cri-o/pkg/config"
+	"github.com/cri-o/cri-o/pkg/container"
 	"github.com/cri-o/cri-o/utils"
-	dockermounts "github.com/docker/docker/pkg/mount"
-	"github.com/docker/docker/pkg/symlink"
+	securejoin "github.com/cyphar/filepath-securejoin"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
+	"github.com/pkg/errors"
 	seccomp "github.com/seccomp/containers-golang"
+	k8sV1 "k8s.io/api/core/v1"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/security/apparmor"
 )
 
 const (
 	seccompUnconfined      = "unconfined"
-	seccompRuntimeDefault  = "runtime/default"
-	seccompDockerDefault   = "docker/default"
 	seccompLocalhostPrefix = "localhost/"
-
-	scopePrefix           = "crio"
-	defaultCgroupfsParent = "/crio"
-	defaultSystemdParent  = "system.slice"
 )
 
 type orderedMounts []rspec.Mount
@@ -89,7 +85,7 @@ func (m criOrderedMounts) parts(i int) int {
 }
 
 // Ensure mount point on which path is mounted, is shared.
-func ensureShared(path string, mountInfos []*dockermounts.Info) error {
+func ensureShared(path string, mountInfos []*mount.Info) error {
 	sourceMount, optionalOpts, err := getSourceMount(path, mountInfos)
 	if err != nil {
 		return err
@@ -107,7 +103,7 @@ func ensureShared(path string, mountInfos []*dockermounts.Info) error {
 }
 
 // Ensure mount point on which path is mounted, is either shared or slave.
-func ensureSharedOrSlave(path string, mountInfos []*dockermounts.Info) error {
+func ensureSharedOrSlave(path string, mountInfos []*mount.Info) error {
 	sourceMount, optionalOpts, err := getSourceMount(path, mountInfos)
 	if err != nil {
 		return err
@@ -124,7 +120,7 @@ func ensureSharedOrSlave(path string, mountInfos []*dockermounts.Info) error {
 	return fmt.Errorf("path %q is mounted on %q but it is not a shared or slave mount", path, sourceMount)
 }
 
-func getMountInfo(mountInfos []*dockermounts.Info, dir string) *dockermounts.Info {
+func getMountInfo(mountInfos []*mount.Info, dir string) *mount.Info {
 	for _, m := range mountInfos {
 		if m.Mountpoint == dir {
 			return m
@@ -133,7 +129,7 @@ func getMountInfo(mountInfos []*dockermounts.Info, dir string) *dockermounts.Inf
 	return nil
 }
 
-func getSourceMount(source string, mountInfos []*dockermounts.Info) (path, optionalMountInfo string, err error) {
+func getSourceMount(source string, mountInfos []*mount.Info) (path, optionalMountInfo string, _ error) {
 	mountinfo := getMountInfo(mountInfos, source)
 	if mountinfo != nil {
 		return source, mountinfo.Optional, nil
@@ -159,14 +155,14 @@ func getSourceMount(source string, mountInfos []*dockermounts.Info) (path, optio
 func addImageVolumes(ctx context.Context, rootfs string, s *Server, containerInfo *storage.ContainerInfo, mountLabel string, specgen *generate.Generator) ([]rspec.Mount, error) {
 	mounts := []rspec.Mount{}
 	for dest := range containerInfo.Config.Config.Volumes {
-		fp, err := symlink.FollowSymlinkInScope(filepath.Join(rootfs, dest), rootfs)
+		fp, err := securejoin.SecureJoin(rootfs, dest)
 		if err != nil {
 			return nil, err
 		}
 		switch s.config.ImageVolumes {
 		case config.ImageVolumesMkdir:
 			IDs := idtools.IDPair{UID: int(specgen.Config.Process.User.UID), GID: int(specgen.Config.Process.User.GID)}
-			if err1 := idtools.MkdirAllAndChownNew(fp, 0755, IDs); err1 != nil {
+			if err1 := idtools.MkdirAllAndChownNew(fp, 0o755, IDs); err1 != nil {
 				return nil, err1
 			}
 			if mountLabel != "" {
@@ -177,7 +173,7 @@ func addImageVolumes(ctx context.Context, rootfs string, s *Server, containerInf
 		case config.ImageVolumesBind:
 			volumeDirName := stringid.GenerateNonCryptoID()
 			src := filepath.Join(containerInfo.RunDir, "mounts", volumeDirName)
-			if err1 := os.MkdirAll(src, 0755); err1 != nil {
+			if err1 := os.MkdirAll(src, 0o755); err1 != nil {
 				return nil, err1
 			}
 			// Label the source with the sandbox selinux mount label
@@ -217,7 +213,7 @@ func resolveSymbolicLink(path, scope string) (string, error) {
 	if scope == "" {
 		scope = "/"
 	}
-	return symlink.FollowSymlinkInScope(path, scope)
+	return securejoin.SecureJoin(scope, path)
 }
 
 func addDevices(ctx context.Context, sb *sandbox.Sandbox, containerConfig *pb.ContainerConfig, privilegedWithoutHostDevices bool, specgen *generate.Generator) error {
@@ -485,29 +481,6 @@ func hostNetwork(containerConfig *pb.ContainerConfig) bool {
 	return securityContext.GetNamespaceOptions().GetNetwork() == pb.NamespaceMode_NODE
 }
 
-// ensureSaneLogPath is a hack to fix https://issues.k8s.io/44043 which causes
-// logPath to be a broken symlink to some magical Docker path. Ideally we
-// wouldn't have to deal with this, but until that issue is fixed we have to
-// remove the path if it's a broken symlink.
-func ensureSaneLogPath(logPath string) error {
-	// If the path exists but the resolved path does not, then we have a broken
-	// symlink and we need to remove it.
-	fi, err := os.Lstat(logPath)
-	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		// Non-existent files and non-symlinks aren't our problem.
-		return nil
-	}
-
-	_, err = os.Stat(logPath)
-	if os.IsNotExist(err) {
-		err = os.RemoveAll(logPath)
-		if err != nil {
-			return fmt.Errorf("ensureSaneLogPath remove bad logPath: %s", err)
-		}
-	}
-	return nil
-}
-
 // addSecretsBindMounts mounts user defined secrets to the container
 func addSecretsBindMounts(ctx context.Context, mountLabel, ctrRunDir string, defaultMounts []string, specgen generate.Generator) ([]rspec.Mount, error) {
 	containerMounts := specgen.Config.Mounts
@@ -519,8 +492,8 @@ func addSecretsBindMounts(ctx context.Context, mountLabel, ctrRunDir string, def
 }
 
 // CreateContainer creates a new container in specified PodSandbox
-func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (res *pb.CreateContainerResponse, err error) {
-	log.Infof(ctx, "Attempting to create container: %s", translateLabelsToDescription(req.GetConfig().GetLabels()))
+func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (res *pb.CreateContainerResponse, retErr error) {
+	log.Infof(ctx, "Creating container: %s", translateLabelsToDescription(req.GetConfig().GetLabels()))
 
 	s.updateLock.RLock()
 	defer s.updateLock.RUnlock()
@@ -546,83 +519,79 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		return nil, fmt.Errorf("CreateContainer failed as the sandbox was stopped: %v", sbID)
 	}
 
-	// The config of the container
-	containerConfig := req.GetConfig()
-	if containerConfig == nil {
-		return nil, fmt.Errorf("CreateContainerRequest.ContainerConfig is nil")
+	ctr := container.New(ctx)
+	if err := ctr.SetConfig(req.GetConfig(), req.GetSandboxConfig()); err != nil {
+		return nil, errors.Wrap(err, "setting container config")
 	}
 
-	if containerConfig.GetMetadata() == nil {
-		return nil, fmt.Errorf("CreateContainerRequest.ContainerConfig.Metadata is nil")
+	if err := ctr.SetNameAndID(); err != nil {
+		return nil, errors.Wrap(err, "setting container name and ID")
 	}
 
-	name := containerConfig.GetMetadata().GetName()
-	if name == "" {
-		return nil, fmt.Errorf("CreateContainerRequest.ContainerConfig.Name is empty")
-	}
-
-	containerID, containerName, err := s.ReserveContainerIDandName(sb.Metadata(), containerConfig)
-	if err != nil {
-		return nil, err
+	if _, err = s.ReserveContainerName(ctr.ID(), ctr.Name()); err != nil {
+		return nil, errors.Wrap(err, "Kubelet may be retrying requests that are timing out in CRI-O due to system load")
 	}
 
 	defer func() {
-		if err != nil {
-			s.ReleaseContainerName(containerName)
+		if retErr != nil {
+			log.Infof(ctx, "createCtr: releasing container name %s", ctr.Name())
+			s.ReleaseContainerName(ctr.Name())
 		}
 	}()
 
-	container, err := s.createSandboxContainer(ctx, containerID, containerName, sb, req.GetSandboxConfig(), containerConfig)
+	newContainer, err := s.createSandboxContainer(ctx, ctr, sb)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
-			err2 := s.StorageRuntimeServer().DeleteContainer(containerID)
+		if retErr != nil {
+			log.Infof(ctx, "createCtr: deleting container %s from storage", ctr.ID())
+			err2 := s.StorageRuntimeServer().DeleteContainer(ctr.ID())
 			if err2 != nil {
 				log.Warnf(ctx, "Failed to cleanup container directory: %v", err2)
 			}
 		}
 	}()
 
-	s.addContainer(container)
+	s.addContainer(newContainer)
 	defer func() {
-		if err != nil {
-			s.removeContainer(container)
+		if retErr != nil {
+			log.Infof(ctx, "createCtr: removing container %s", newContainer.ID())
+			s.removeContainer(newContainer)
 		}
 	}()
 
-	if err := s.CtrIDIndex().Add(containerID); err != nil {
+	if err := s.CtrIDIndex().Add(ctr.ID()); err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
-			if err2 := s.CtrIDIndex().Delete(containerID); err2 != nil {
-				log.Warnf(ctx, "couldn't delete ctr id %s from idIndex", containerID)
+		if retErr != nil {
+			log.Infof(ctx, "createCtr: deleting container ID %s from idIndex", ctr.ID())
+			if err2 := s.CtrIDIndex().Delete(ctr.ID()); err2 != nil {
+				log.Warnf(ctx, "couldn't delete ctr id %s from idIndex", ctr.ID())
 			}
 		}
 	}()
 
-	if err := s.createContainerPlatform(container, sb.InfraContainer(), sb.CgroupParent()); err != nil {
+	if err := s.createContainerPlatform(newContainer, sb.CgroupParent()); err != nil {
 		return nil, err
 	}
 
-	if err := s.ContainerStateToDisk(container); err != nil {
-		log.Warnf(ctx, "unable to write containers %s state to disk: %v", container.ID(), err)
+	if err := s.ContainerStateToDisk(newContainer); err != nil {
+		log.Warnf(ctx, "unable to write containers %s state to disk: %v", newContainer.ID(), err)
 	}
 
-	container.SetCreated()
+	newContainer.SetCreated()
 
-	if err := s.MonitorConmon(container); err != nil {
-		log.Errorf(ctx, "%v", err)
+	if ctx.Err() == context.Canceled || ctx.Err() == context.DeadlineExceeded {
+		log.Infof(ctx, "createCtr: context was either canceled or the deadline was exceeded: %v", ctx.Err())
+		return nil, ctx.Err()
 	}
 
-	log.Infof(ctx, "Created container: %s", container.Description())
-	resp := &pb.CreateContainerResponse{
-		ContainerId: containerID,
-	}
-
-	return resp, nil
+	log.Infof(ctx, "Created container %s: %s", newContainer.ID(), newContainer.Description())
+	return &pb.CreateContainerResponse{
+		ContainerId: ctr.ID(),
+	}, nil
 }
 
 func isInCRIMounts(dst string, mounts []*pb.Mount) bool {
@@ -640,7 +609,7 @@ func (s *Server) setupSeccomp(ctx context.Context, specgen *generate.Generator, 
 		specgen.Config.Linux.Seccomp = nil
 		return nil
 	}
-	if !s.seccompEnabled {
+	if s.Config().Seccomp().IsDisabled() {
 		if profile != seccompUnconfined {
 			return fmt.Errorf("seccomp is not enabled in your kernel, cannot run with a profile")
 		}
@@ -653,8 +622,8 @@ func (s *Server) setupSeccomp(ctx context.Context, specgen *generate.Generator, 
 	}
 
 	// Load the default seccomp profile from the server if the profile is a default one
-	if profile == seccompRuntimeDefault || profile == seccompDockerDefault {
-		linuxSpecs, err := seccomp.LoadProfileFromConfig(s.seccompProfile, specgen.Config)
+	if profile == k8sV1.SeccompProfileRuntimeDefault || profile == k8sV1.DeprecatedSeccompProfileDockerDefault {
+		linuxSpecs, err := seccomp.LoadProfileFromConfig(s.Config().Seccomp().Profile(), specgen.Config)
 		if err != nil {
 			return err
 		}
@@ -677,18 +646,4 @@ func (s *Server) setupSeccomp(ctx context.Context, specgen *generate.Generator, 
 	}
 	specgen.Config.Linux.Seccomp = linuxSpecs
 	return nil
-}
-
-// getAppArmorProfileName gets the profile name for the given container.
-func (s *Server) getAppArmorProfileName(profile string) string {
-	if profile == "" {
-		return ""
-	}
-
-	if profile == apparmor.ProfileRuntimeDefault {
-		// If the value is runtime/default, then return default profile.
-		return s.appArmorProfile
-	}
-
-	return strings.TrimPrefix(profile, apparmor.ProfileNamePrefix)
 }

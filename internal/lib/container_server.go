@@ -2,24 +2,22 @@ package lib
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/containers/image/v5/types"
 	"github.com/containers/libpod/pkg/annotations"
 	"github.com/containers/libpod/pkg/hooks"
 	"github.com/containers/libpod/pkg/registrar"
 	cstorage "github.com/containers/storage"
+	"github.com/containers/storage/pkg/ioutils"
+	"github.com/containers/storage/pkg/truncindex"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
 	libconfig "github.com/cri-o/cri-o/pkg/config"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/truncindex"
+	json "github.com/json-iterator/go"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
@@ -28,13 +26,17 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
 )
 
+// ContainerManagerCRIO specifies an annotation value which indicates that the
+// container has been created by CRI-O. Usually used together with the key
+// `io.container.manager`.
+const ContainerManagerCRIO = "cri-o"
+
 // ContainerServer implements the ImageServer
 type ContainerServer struct {
 	runtime              *oci.Runtime
 	store                cstorage.Store
 	storageImageServer   storage.ImageServer
 	storageRuntimeServer storage.RuntimeServer
-	updateLock           sync.RWMutex
 	ctrNameIndex         *registrar.Registrar
 	ctrIDIndex           *truncindex.TruncIndex
 	podNameIndex         *registrar.Registrar
@@ -44,8 +46,6 @@ type ContainerServer struct {
 	stateLock sync.Locker
 	state     *containerServerState
 	config    *libconfig.Config
-
-	*conmonmon
 }
 
 // Runtime returns the oci runtime for the ContainerServer
@@ -94,7 +94,7 @@ func (c *ContainerServer) StorageRuntimeServer() storage.RuntimeServer {
 }
 
 // New creates a new ContainerServer with options provided
-func New(ctx context.Context, systemContext *types.SystemContext, configIface libconfig.Iface) (*ContainerServer, error) {
+func New(ctx context.Context, configIface libconfig.Iface) (*ContainerServer, error) {
 	if configIface == nil {
 		return nil, fmt.Errorf("provided config is nil")
 	}
@@ -108,7 +108,7 @@ func New(ctx context.Context, systemContext *types.SystemContext, configIface li
 		return nil, fmt.Errorf("cannot create container server: interface is nil")
 	}
 
-	imageService, err := storage.GetImageService(ctx, systemContext, store, config.DefaultTransport, config.InsecureRegistries, config.Registries)
+	imageService, err := storage.GetImageService(ctx, config.SystemContext, store, config.DefaultTransport, config.InsecureRegistries, config.Registries)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +122,7 @@ func New(ctx context.Context, systemContext *types.SystemContext, configIface li
 		return nil, err
 	}
 
-	cs := &ContainerServer{
+	return &ContainerServer{
 		runtime:              runtime,
 		store:                store,
 		storageImageServer:   imageService,
@@ -140,146 +140,22 @@ func New(ctx context.Context, systemContext *types.SystemContext, configIface li
 			processLevels:   make(map[string]int),
 		},
 		config: config,
-	}
-
-	cmm := cs.newConmonmon(runtime)
-	cs.conmonmon = cmm
-
-	return cs, nil
-}
-
-// Update makes changes to the server's state (lists of pods and containers) to
-// reflect the list of pods and containers that are stored on disk, possibly
-// having been modified by other parties
-func (c *ContainerServer) Update() error {
-	c.updateLock.Lock()
-	defer c.updateLock.Unlock()
-
-	containers, err := c.store.Containers()
-	if err != nil && !os.IsNotExist(errors.Cause(err)) {
-		logrus.Warnf("could not read containers and sandboxes: %v", err)
-		return err
-	}
-	newPods := map[string]*storage.RuntimeContainerMetadata{}
-	oldPods := map[string]string{}
-	removedPods := map[string]string{}
-	newPodContainers := map[string]*storage.RuntimeContainerMetadata{}
-	oldPodContainers := map[string]string{}
-	removedPodContainers := map[string]string{}
-	for i := range containers {
-		container := &containers[i]
-		if c.HasSandbox(container.ID) {
-			// FIXME: do we need to reload/update any info about the sandbox?
-			oldPods[container.ID] = container.ID
-			oldPodContainers[container.ID] = container.ID
-			continue
-		}
-		if c.GetContainer(container.ID) != nil {
-			// FIXME: do we need to reload/update any info about the container?
-			oldPodContainers[container.ID] = container.ID
-			continue
-		}
-		// not previously known, so figure out what it is
-		metadata, err2 := c.storageRuntimeServer.GetContainerMetadata(container.ID)
-		if err2 != nil {
-			logrus.Errorf("error parsing metadata for %s: %v, ignoring", container.ID, err2)
-			continue
-		}
-		if metadata.Pod {
-			newPods[container.ID] = &metadata
-		} else {
-			newPodContainers[container.ID] = &metadata
-		}
-	}
-	c.ctrIDIndex.Iterate(func(id string) {
-		if _, ok := oldPodContainers[id]; !ok {
-			// this container's ID wasn't in the updated list -> removed
-			removedPodContainers[id] = id
-		} else {
-			ctr := c.GetContainer(id)
-			if ctr != nil {
-				// if the container exists, update its state
-				if err := c.ContainerStateFromDisk(c.GetContainer(id)); err != nil {
-					logrus.Warnf("unable to retrieve containers %s state from disk: %v", id, err)
-				}
-			}
-		}
-	})
-	for removedPodContainer := range removedPodContainers {
-		// forget this container
-		ctr := c.GetContainer(removedPodContainer)
-		if ctr == nil {
-			logrus.Warnf("bad state when getting container removed %+v", removedPodContainer)
-			continue
-		}
-		c.ReleaseContainerName(ctr.Name())
-		c.RemoveContainer(ctr)
-		if err := c.ctrIDIndex.Delete(ctr.ID()); err != nil {
-			return err
-		}
-		logrus.Debugf("forgetting removed pod container %s", ctr.ID())
-	}
-	c.PodIDIndex().Iterate(func(id string) {
-		if _, ok := oldPods[id]; !ok {
-			// this pod's ID wasn't in the updated list -> removed
-			removedPods[id] = id
-		}
-	})
-	for removedPod := range removedPods {
-		// forget this pod
-		sb := c.GetSandbox(removedPod)
-		if sb == nil {
-			logrus.Warnf("bad state when getting pod to remove %+v", removedPod)
-			continue
-		}
-		podInfraContainer := sb.InfraContainer()
-		c.ReleaseContainerName(podInfraContainer.Name())
-		c.RemoveContainer(podInfraContainer)
-		if err := c.ctrIDIndex.Delete(podInfraContainer.ID()); err != nil {
-			return err
-		}
-		sb.RemoveInfraContainer()
-		c.ReleasePodName(sb.Name())
-		if err := c.RemoveSandbox(sb.ID()); err != nil {
-			logrus.Warnf("failed to remove sandbox ID %s: %v", sb.ID(), err)
-		}
-		if err := c.podIDIndex.Delete(sb.ID()); err != nil {
-			return err
-		}
-		logrus.Debugf("forgetting removed pod %s", sb.ID())
-	}
-	for sandboxID := range newPods {
-		// load this pod
-		if err = c.LoadSandbox(sandboxID); err != nil {
-			logrus.Warnf("could not load new pod sandbox %s: %v, ignoring", sandboxID, err)
-		} else {
-			logrus.Debugf("loaded new pod sandbox %s: %v", sandboxID, err)
-		}
-	}
-	for containerID := range newPodContainers {
-		// load this container
-		if err = c.LoadContainer(containerID); err != nil {
-			logrus.Warnf("could not load new sandbox container %s: %v, ignoring", containerID, err)
-		} else {
-			logrus.Debugf("loaded new pod container %s: %v", containerID, err)
-		}
-	}
-	return nil
+	}, nil
 }
 
 // LoadSandbox loads a sandbox from the disk into the sandbox store
-func (c *ContainerServer) LoadSandbox(id string) error {
+func (c *ContainerServer) LoadSandbox(id string) (retErr error) {
 	config, err := c.store.FromContainerDirectory(id, "config.json")
 	if err != nil {
 		return err
 	}
 	var m rspec.Spec
 	if err := json.Unmarshal(config, &m); err != nil {
-		return err
+		return errors.Wrap(err, "error unmarshalling sandbox spec")
 	}
 	labels := make(map[string]string)
 	if err := json.Unmarshal([]byte(m.Annotations[annotations.Labels]), &labels); err != nil {
-		return err
+		return errors.Wrapf(err, "error unmarshalling %s annotation", annotations.Labels)
 	}
 	name := m.Annotations[annotations.Name]
 	name, err = c.ReservePodName(id, name)
@@ -287,45 +163,43 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 		return err
 	}
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			c.ReleasePodName(name)
 		}
 	}()
 	var metadata pb.PodSandboxMetadata
 	if err := json.Unmarshal([]byte(m.Annotations[annotations.Metadata]), &metadata); err != nil {
-		return err
+		return errors.Wrapf(err, "error unmarshalling %s annotation", annotations.Metadata)
 	}
 
-	dupLabels, err := label.DupSecOpt(m.Process.SelinuxLabel)
-	if err != nil {
-		return err
-	}
-
-	processLabel, mountLabel, err := label.InitLabels(dupLabels)
-	if err != nil {
-		return err
-	}
+	processLabel := m.Process.SelinuxLabel
+	mountLabel := m.Linux.MountLabel
 
 	spp := m.Annotations[annotations.SeccompProfilePath]
 
 	kubeAnnotations := make(map[string]string)
 	if err := json.Unmarshal([]byte(m.Annotations[annotations.Annotations]), &kubeAnnotations); err != nil {
-		return err
+		return errors.Wrapf(err, "error unmarshalling %s annotation", annotations.Annotations)
 	}
 
 	portMappings := []*hostport.PortMapping{}
 	if err := json.Unmarshal([]byte(m.Annotations[annotations.PortMappings]), &portMappings); err != nil {
-		return err
+		return errors.Wrapf(err, "error unmarshalling %s annotation", annotations.PortMappings)
 	}
 
 	privileged := isTrue(m.Annotations[annotations.PrivilegedRuntime])
 	hostNetwork := isTrue(m.Annotations[annotations.HostNetwork])
 	nsOpts := pb.NamespaceOption{}
 	if err := json.Unmarshal([]byte(m.Annotations[annotations.NamespaceOptions]), &nsOpts); err != nil {
-		return err
+		return errors.Wrapf(err, "error unmarshalling %s annotation", annotations.NamespaceOptions)
 	}
 
-	sb, err := sandbox.New(id, m.Annotations[annotations.Namespace], name, m.Annotations[annotations.KubeName], filepath.Dir(m.Annotations[annotations.LogPath]), labels, kubeAnnotations, processLabel, mountLabel, &metadata, m.Annotations[annotations.ShmPath], m.Annotations[annotations.CgroupParent], privileged, m.Annotations[annotations.RuntimeHandler], m.Annotations[annotations.ResolvPath], m.Annotations[annotations.HostName], portMappings, hostNetwork)
+	created, err := time.Parse(time.RFC3339Nano, m.Annotations[annotations.Created])
+	if err != nil {
+		return errors.Wrap(err, "parsing created timestamp annotation")
+	}
+
+	sb, err := sandbox.New(id, m.Annotations[annotations.Namespace], name, m.Annotations[annotations.KubeName], filepath.Dir(m.Annotations[annotations.LogPath]), labels, kubeAnnotations, processLabel, mountLabel, &metadata, m.Annotations[annotations.ShmPath], m.Annotations[annotations.CgroupParent], privileged, m.Annotations[annotations.RuntimeHandler], m.Annotations[annotations.ResolvPath], m.Annotations[annotations.HostName], portMappings, hostNetwork, created)
 	if err != nil {
 		return err
 	}
@@ -333,16 +207,30 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 	sb.SetSeccompProfilePath(spp)
 	sb.SetNamespaceOptions(&nsOpts)
 
-	// We add a netNS only if we can load a permanent one.
+	// We add an NS only if we can load a permanent one.
 	// Otherwise, the sandbox will live in the host namespace.
-	if c.config.ManageNetworkNSLifecycle {
-		netNsPath, err := configNetNsPath(&m)
+	if c.config.ManageNSLifecycle {
+		netNsPath, err := configNsPath(&m, rspec.NetworkNamespace)
 		if err == nil {
-			nsErr := sb.NetNsJoin(netNsPath, sb.Name())
-			// If we can't load the networking namespace
-			// because it's closed, we just set the sb netns
-			// pointer to nil. Otherwise we return an error.
-			if nsErr != nil && nsErr != sandbox.ErrClosedNetNS {
+			if nsErr := sb.NetNsJoin(netNsPath); nsErr != nil {
+				return nsErr
+			}
+		}
+		ipcNsPath, err := configNsPath(&m, rspec.IPCNamespace)
+		if err == nil {
+			if nsErr := sb.IpcNsJoin(ipcNsPath); nsErr != nil {
+				return nsErr
+			}
+		}
+		utsNsPath, err := configNsPath(&m, rspec.UTSNamespace)
+		if err == nil {
+			if nsErr := sb.UtsNsJoin(utsNsPath); nsErr != nil {
+				return nsErr
+			}
+		}
+		userNsPath, err := configNsPath(&m, rspec.UserNamespace)
+		if err == nil {
+			if nsErr := sb.UserNsJoin(userNsPath); nsErr != nil {
 				return nsErr
 			}
 		}
@@ -353,7 +241,7 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 	}
 
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			if err := c.RemoveSandbox(sb.ID()); err != nil {
 				logrus.Warnf("could not remove sandbox ID %s: %v", sb.ID(), err)
 			}
@@ -375,17 +263,12 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 		return err
 	}
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			c.ReleaseContainerName(cname)
 		}
 	}()
 
-	created, err := time.Parse(time.RFC3339Nano, m.Annotations[annotations.Created])
-	if err != nil {
-		return err
-	}
-
-	scontainer, err := oci.NewContainer(m.Annotations[annotations.ContainerID], cname, sandboxPath, m.Annotations[annotations.LogPath], sb.NetNs().Path(), labels, m.Annotations, kubeAnnotations, "", "", "", nil, id, false, false, false, privileged, sb.RuntimeHandler(), sandboxDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
+	scontainer, err := oci.NewContainer(m.Annotations[annotations.ContainerID], cname, sandboxPath, m.Annotations[annotations.LogPath], labels, m.Annotations, kubeAnnotations, m.Annotations[annotations.Image], "", "", nil, id, false, false, false, sb.RuntimeHandler(), sandboxDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
 	if err != nil {
 		return err
 	}
@@ -405,28 +288,42 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 	if err := c.ContainerStateFromDisk(scontainer); err != nil {
 		return fmt.Errorf("error reading sandbox state from disk %q: %v", scontainer.ID(), err)
 	}
-	sb.SetCreated()
-	if err := c.MonitorConmon(scontainer); err != nil {
-		return fmt.Errorf("error adding conmon of sandbox container %s to monitoring loop: %v", scontainer.ID(), err)
+
+	// We write back the state because it is possible that crio did not have a chance to
+	// read the exit file and persist exit code into the state on reboot.
+	if err := c.ContainerStateToDisk(scontainer); err != nil {
+		return fmt.Errorf("failed to write container state to disk %q: %v", scontainer.ID(), err)
 	}
+
+	sb.SetCreated()
 	if err := label.ReserveLabel(processLabel); err != nil {
 		return err
 	}
 	if err := sb.SetInfraContainer(scontainer); err != nil {
 		return err
 	}
+
+	sb.RestoreStopped()
+
 	if err := c.ctrIDIndex.Add(scontainer.ID()); err != nil {
 		return err
 	}
+	defer func() {
+		if retErr != nil {
+			if err1 := c.ctrIDIndex.Delete(scontainer.ID()); err1 != nil {
+				logrus.Warnf("could not delete container ID %s: %v", scontainer.ID(), err1)
+			}
+		}
+	}()
 	if err := c.podIDIndex.Add(id); err != nil {
 		return err
 	}
 	return nil
 }
 
-func configNetNsPath(spec *rspec.Spec) (string, error) {
+func configNsPath(spec *rspec.Spec, nsType rspec.LinuxNamespaceType) (string, error) {
 	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type != rspec.NetworkNamespace {
+		if ns.Type != nsType {
 			continue
 		}
 
@@ -440,8 +337,10 @@ func configNetNsPath(spec *rspec.Spec) (string, error) {
 	return "", fmt.Errorf("missing networking namespace")
 }
 
+var ErrIsNonCrioContainer = errors.New("non CRI-O container")
+
 // LoadContainer loads a container from the disk into the container store
-func (c *ContainerServer) LoadContainer(id string) error {
+func (c *ContainerServer) LoadContainer(id string) (retErr error) {
 	config, err := c.store.FromContainerDirectory(id, "config.json")
 	if err != nil {
 		return err
@@ -450,6 +349,12 @@ func (c *ContainerServer) LoadContainer(id string) error {
 	if err := json.Unmarshal(config, &m); err != nil {
 		return err
 	}
+
+	// Do not interact with containers of others
+	if manager, ok := m.Annotations[annotations.ContainerManager]; ok && manager != ContainerManagerCRIO {
+		return ErrIsNonCrioContainer
+	}
+
 	labels := make(map[string]string)
 	if err := json.Unmarshal([]byte(m.Annotations[annotations.Labels]), &labels); err != nil {
 		return err
@@ -461,7 +366,7 @@ func (c *ContainerServer) LoadContainer(id string) error {
 	}
 
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			c.ReleaseContainerName(name)
 		}
 	}()
@@ -514,7 +419,7 @@ func (c *ContainerServer) LoadContainer(id string) error {
 		return err
 	}
 
-	ctr, err := oci.NewContainer(id, name, containerPath, m.Annotations[annotations.LogPath], sb.NetNs().Path(), labels, m.Annotations, kubeAnnotations, img, imgName, imgRef, &metadata, sb.ID(), tty, stdin, stdinOnce, sb.Privileged(), sb.RuntimeHandler(), containerDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
+	ctr, err := oci.NewContainer(id, name, containerPath, m.Annotations[annotations.LogPath], labels, m.Annotations, kubeAnnotations, img, imgName, imgRef, &metadata, sb.ID(), tty, stdin, stdinOnce, sb.RuntimeHandler(), containerDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
 	if err != nil {
 		return err
 	}
@@ -526,12 +431,15 @@ func (c *ContainerServer) LoadContainer(id string) error {
 	if err := c.ContainerStateFromDisk(ctr); err != nil {
 		return fmt.Errorf("error reading container state from disk %q: %v", ctr.ID(), err)
 	}
+
+	// We write back the state because it is possible that crio did not have a chance to
+	// read the exit file and persist exit code into the state on reboot.
+	if err := c.ContainerStateToDisk(ctr); err != nil {
+		return fmt.Errorf("failed to write container state to disk %q: %v", ctr.ID(), err)
+	}
 	ctr.SetCreated()
 
 	c.AddContainer(ctr)
-	if err := c.MonitorConmon(ctr); err != nil {
-		return fmt.Errorf("error adding conmon of %s to monitoring loop: %v", ctr.ID(), err)
-	}
 
 	return c.ctrIDIndex.Add(id)
 }
@@ -556,11 +464,14 @@ func (c *ContainerServer) ContainerStateFromDisk(ctr *oci.Container) error {
 // ContainerStateToDisk writes the container's state information to a JSON file
 // on disk
 func (c *ContainerServer) ContainerStateToDisk(ctr *oci.Container) error {
+	if ctr == nil {
+		return nil
+	}
 	if err := c.Runtime().UpdateContainerStatus(ctr); err != nil {
 		logrus.Warnf("error updating the container status %q: %v", ctr.ID(), err)
 	}
 
-	jsonSource, err := ioutils.NewAtomicFileWriter(ctr.StatePath(), 0644)
+	jsonSource, err := ioutils.NewAtomicFileWriter(ctr.StatePath(), 0o644)
 	if err != nil {
 		return err
 	}
@@ -613,7 +524,7 @@ func recoverLogError() {
 func (c *ContainerServer) Shutdown() error {
 	defer recoverLogError()
 	_, err := c.store.Shutdown(false)
-	if err != nil && errors.Cause(err) != cstorage.ErrLayerUsedByContainer {
+	if err != nil && !errors.Is(err, cstorage.ErrLayerUsedByContainer) {
 		return err
 	}
 	return nil
@@ -690,6 +601,7 @@ func (c *ContainerServer) ListContainers(filters ...func(*oci.Container) bool) (
 		for _, filter := range filters {
 			if filter(container) {
 				filteredContainers = append(filteredContainers, container)
+				break
 			}
 		}
 	}
@@ -744,4 +656,64 @@ func (c *ContainerServer) RemoveSandbox(id string) error {
 // ListSandboxes lists all sandboxes in the state store
 func (c *ContainerServer) ListSandboxes() []*sandbox.Sandbox {
 	return c.state.sandboxes.List()
+}
+
+// StopContainerAndWait is a wrapping function that stops a container and waits for the container state to be stopped
+func (c *ContainerServer) StopContainerAndWait(ctx context.Context, ctr *oci.Container, timeout int64) error {
+	if err := c.Runtime().StopContainer(ctx, ctr, timeout); err != nil {
+		return fmt.Errorf("failed to stop container %s: %v", ctr.Name(), err)
+	}
+	if err := c.Runtime().WaitContainerStateStopped(ctx, ctr); err != nil {
+		return fmt.Errorf("failed to get container 'stopped' status %s: %v", ctr.Name(), err)
+	}
+	return nil
+}
+
+func (c *ContainerServer) UpdateContainerLinuxResources(ctr *oci.Container, resources *rspec.LinuxResources) {
+	updatedSpec := ctr.Spec()
+	if updatedSpec.Linux == nil {
+		updatedSpec.Linux = &rspec.Linux{}
+	}
+
+	if updatedSpec.Linux.Resources == nil {
+		updatedSpec.Linux.Resources = &rspec.LinuxResources{}
+	}
+
+	if updatedSpec.Linux.Resources.CPU == nil {
+		updatedSpec.Linux.Resources.CPU = &rspec.LinuxCPU{}
+	}
+
+	if *resources.CPU.Shares != 0 {
+		updatedSpec.Linux.Resources.CPU.Shares = resources.CPU.Shares
+	}
+
+	if *resources.CPU.Quota != 0 {
+		updatedSpec.Linux.Resources.CPU.Quota = resources.CPU.Quota
+	}
+
+	if *resources.CPU.Period != 0 {
+		updatedSpec.Linux.Resources.CPU.Period = resources.CPU.Period
+	}
+
+	if resources.CPU.Cpus != "" {
+		updatedSpec.Linux.Resources.CPU.Cpus = resources.CPU.Cpus
+	}
+
+	if resources.CPU.Mems != "" {
+		updatedSpec.Linux.Resources.CPU.Mems = resources.CPU.Mems
+	}
+
+	if updatedSpec.Linux.Resources.Memory == nil {
+		updatedSpec.Linux.Resources.Memory = &rspec.LinuxMemory{}
+	}
+
+	if *resources.Memory.Limit != 0 {
+		updatedSpec.Linux.Resources.Memory.Limit = resources.Memory.Limit
+	}
+
+	updatedSpec.Linux.Resources.Memory.Swap = resources.Memory.Swap
+
+	ctr.SetSpec(&updatedSpec)
+
+	c.state.containers.Add(ctr.ID(), ctr)
 }

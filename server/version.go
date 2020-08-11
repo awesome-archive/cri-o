@@ -17,11 +17,11 @@ const (
 )
 
 // Version returns the runtime name, runtime version and runtime API version
-func (s *Server) Version(ctx context.Context, req *pb.VersionRequest) (resp *pb.VersionResponse, err error) {
+func (s *Server) Version(ctx context.Context, req *pb.VersionRequest) (*pb.VersionResponse, error) {
 	return &pb.VersionResponse{
 		Version:           kubeAPIVersion,
 		RuntimeName:       containerName,
-		RuntimeVersion:    version.Version,
+		RuntimeVersion:    version.Get().Version,
 		RuntimeApiVersion: runtimeAPIVersion,
 	}, nil
 }

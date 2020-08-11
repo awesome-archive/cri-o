@@ -3,69 +3,29 @@
 package oci
 
 import (
+	"bufio"
 	"fmt"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/containers/libpod/pkg/cgroups"
-	"github.com/cri-o/cri-o/utils"
-	"github.com/opencontainers/runc/libcontainer"
-	rspec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/cri-o/cri-o/internal/config/node"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
-func createUnitName(prefix, name string) string {
-	return fmt.Sprintf("%s-%s.scope", prefix, name)
-}
-
-func createConmonUnitName(name string) string {
-	return createUnitName("crio-conmon", name)
-}
-
-func (r *runtimeOCI) createContainerPlatform(c *Container, cgroupParent string, pid int) {
+func (r *runtimeOCI) createContainerPlatform(c *Container, cgroupParent string, pid int) error {
 	// Move conmon to specified cgroup
-	if r.config.ConmonCgroup == "pod" || r.config.ConmonCgroup == "" {
-		switch r.config.CgroupManager {
-		case SystemdCgroupsManager:
-			logrus.Debugf("Running conmon under slice %s and unitName %s", cgroupParent, createConmonUnitName(c.id))
-			if err := utils.RunUnderSystemdScope(pid, cgroupParent, createConmonUnitName(c.id)); err != nil {
-				logrus.Warnf("Failed to add conmon to systemd sandbox cgroup: %v", err)
-			}
-		case CgroupfsCgroupsManager:
-			cgroupPath := filepath.Join(cgroupParent, "/crio-conmon-"+c.id)
-			control, err := cgroups.New(cgroupPath, &rspec.LinuxResources{})
-			if err != nil {
-				logrus.Warnf("Failed to add conmon to cgroupfs sandbox cgroup: %v", err)
-			}
-			if control == nil {
-				break
-			}
-			// Record conmon's cgroup path in the container, so we can properly
-			// clean it up when removing the container.
-			c.conmonCgroupfsPath = cgroupPath
-			// Here we should defer a crio-connmon- cgroup hierarchy deletion, but it will
-			// always fail as conmon's pid is still there.
-			// Fortunately, kubelet takes care of deleting this for us, so the leak will
-			// only happens in corner case where one does a manual deletion of the container
-			// through e.g. runc. This should be handled by implementing a conmon monitoring
-			// routine that does the cgroup cleanup once conmon is terminated.
-			if err := control.AddPid(pid); err != nil {
-				logrus.Warnf("Failed to add conmon to cgroupfs sandbox cgroup: %v", err)
-			}
-		default:
-			// error for an unknown cgroups manager
-			logrus.Errorf("unknown cgroups manager %q for sandbox cgroup", r.config.CgroupManager)
-		}
-	} else if strings.HasSuffix(r.config.ConmonCgroup, ".slice") {
-		logrus.Debugf("Running conmon under custom slice %s and unitName %s", r.config.ConmonCgroup, createConmonUnitName(c.id))
-		if err := utils.RunUnderSystemdScope(pid, r.config.ConmonCgroup, createConmonUnitName(c.id)); err != nil {
-			logrus.Warnf("Failed to add conmon to custom systemd sandbox cgroup: %v", err)
-		}
+	conmonCgroupfsPath, err := r.config.CgroupManager().MoveConmonToCgroup(c.id, cgroupParent, r.config.ConmonCgroup, pid)
+	if err != nil {
+		return err
 	}
+	c.conmonCgroupfsPath = conmonCgroupfsPath
+	return nil
 }
 
 func sysProcAttrPlatform() *syscall.SysProcAttr {
@@ -75,7 +35,7 @@ func sysProcAttrPlatform() *syscall.SysProcAttr {
 }
 
 // newPipe creates a unix socket pair for communication
-func newPipe() (parent, child *os.File, err error) {
+func newPipe() (parent, child *os.File, _ error) {
 	fds, err := unix.Socketpair(unix.AF_LOCAL, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, err
@@ -83,45 +43,62 @@ func newPipe() (parent, child *os.File, err error) {
 	return os.NewFile(uintptr(fds[1]), "parent"), os.NewFile(uintptr(fds[0]), "child"), nil
 }
 
-func loadFactory(root string) (libcontainer.Factory, error) {
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		return nil, err
-	}
-	cgroupManager := libcontainer.Cgroupfs
-	return libcontainer.New(abs, cgroupManager, libcontainer.CriuPath(""))
-}
-
-// libcontainerStats gets the stats for the container with the given id from runc/libcontainer
-func (r *runtimeOCI) libcontainerStats(ctr *Container) (*libcontainer.Stats, error) {
-	factory, err := loadFactory(r.root)
-	if err != nil {
-		return nil, err
-	}
-	container, err := factory.Load(ctr.ID())
-	if err != nil {
-		return nil, err
-	}
-	return container.Stats()
-}
-
-func (r *runtimeOCI) containerStats(ctr *Container) (*ContainerStats, error) {
-	libcontainerStats, err := r.libcontainerStats(ctr)
-	if err != nil {
-		return nil, err
-	}
-	cgroupStats := libcontainerStats.CgroupStats
-	stats := new(ContainerStats)
+func (r *runtimeOCI) containerStats(ctr *Container, cgroup string) (*ContainerStats, error) {
+	stats := &ContainerStats{}
+	var err error
 	stats.Container = ctr.ID()
-	stats.CPUNano = cgroupStats.CpuStats.CpuUsage.TotalUsage
 	stats.SystemNano = time.Now().UnixNano()
-	stats.CPU = calculateCPUPercent(libcontainerStats)
-	stats.MemUsage = cgroupStats.MemoryStats.Usage.Usage
-	stats.MemLimit = getMemLimit(cgroupStats.MemoryStats.Usage.Limit)
+
+	// technically, the CRI does not mandate a CgroupParent is given to a pod
+	// this situation should never happen in production, but some test suites
+	// (such as critest) assume we can call stats on a cgroupless container
+	if cgroup == "" {
+		return stats, nil
+	}
+	// gets the real path of the cgroup on disk
+	cgroupPath, err := r.config.CgroupManager().ContainerCgroupAbsolutePath(cgroup, ctr.ID())
+	if err != nil {
+		return nil, err
+	}
+	// checks cgroup just for the container, not the entire pod
+	cg, err := cgroups.Load(cgroupPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to load cgroup at %s", cgroup)
+	}
+
+	cgroupStats, err := cg.Stat()
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to obtain cgroup stats")
+	}
+
+	stats.CPUNano = cgroupStats.CPU.Usage.Total
+	stats.CPU = calculateCPUPercent(cgroupStats)
+	stats.MemUsage = cgroupStats.Memory.Usage.Usage
+	stats.MemLimit = getMemLimit(cgroupStats.Memory.Usage.Limit)
 	stats.MemPerc = float64(stats.MemUsage) / float64(stats.MemLimit)
-	stats.PIDs = cgroupStats.PidsStats.Current
-	stats.BlockInput, stats.BlockOutput = calculateBlockIO(libcontainerStats)
-	stats.NetInput, stats.NetOutput = getContainerNetIO(libcontainerStats)
+	stats.PIDs = cgroupStats.Pids.Current
+	stats.BlockInput, stats.BlockOutput = calculateBlockIO(cgroupStats)
+
+	// Try our best to get the net namespace path.
+	// If pid() errors, the container has stopped, and the /proc entry
+	// won't exist anyway.
+	pid, _ := ctr.pid() // nolint:errcheck
+	if pid > 0 {
+		netNsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+		stats.NetInput, stats.NetOutput = getContainerNetIO(netNsPath)
+	}
+
+	totalInactiveFile, err := getTotalInactiveFile()
+	if err != nil { // nolint: gocritic
+		logrus.Warnf("error in memory working set stats retrieval: %v", err)
+	} else if stats.MemUsage > totalInactiveFile {
+		stats.WorkingSetBytes = stats.MemUsage - totalInactiveFile
+	} else {
+		logrus.Debugf(
+			"unable to account working set stats: total_inactive_file (%d) > memory usage (%d)",
+			totalInactiveFile, stats.MemUsage,
+		)
+	}
 
 	return stats, nil
 }
@@ -174,4 +151,41 @@ func metricsToCtrStats(c *Container, m *cgroups.Metrics) *ContainerStats {
 		BlockOutput: blockOutput,
 		PIDs:        pids,
 	}
+}
+
+// getTotalInactiveFile returns the value if `total_inactive_file` as integer
+// from `/sys/fs/cgroup/memory/memory.stat`. It returns an error if the file is
+// not parsable.
+func getTotalInactiveFile() (uint64, error) {
+	// TODO: no cgroupv2 support right now
+	if node.CgroupIsV2() {
+		return 0, nil
+	}
+
+	const memoryStat = "/sys/fs/cgroup/memory/memory.stat"
+	const totalInactiveFilePrefix = "total_inactive_file "
+	f, err := os.Open(memoryStat)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), totalInactiveFilePrefix) {
+			val, err := strconv.Atoi(
+				strings.TrimPrefix(scanner.Text(), totalInactiveFilePrefix),
+			)
+			if err != nil {
+				return 0, errors.Wrap(err, "unable to parse total inactive file value")
+			}
+			return uint64(val), nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+
+	return 0, errors.Errorf("%q not found in %v", totalInactiveFilePrefix, memoryStat)
 }

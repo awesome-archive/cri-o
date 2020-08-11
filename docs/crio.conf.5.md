@@ -44,14 +44,18 @@ CRI-O reads its storage defaults from the containers-storage.conf(5) file locate
 **log_dir**="/var/log/crio/pods"
   The default log directory where all logs will go unless directly specified by the kubelet. The log directory specified must be an absolute directory.
 
-**version_file**="/var/lib/crio/version"
-  Location for crio to lay down the version file.
+**version_file**="/var/run/crio/version"
+  Location for CRI-O to lay down the temporary version file.
+  It is used to check if crio wipe should wipe containers, which should
+  always happen on a node reboot
+
+**version_file_persist**="/var/lib/crio/version"
+  Location for CRI-O to lay down the persistent version file.
+  It is used to check if crio wipe should wipe images, which should
+  only happen when CRI-O has been upgraded
 
 ## CRIO.API TABLE
 The `crio.api` table contains settings for the kubelet/gRPC interface.
-
-**host_ip**=""
-  Host IPs are the addresses to be used for the host network. It is not possible to assign more than two addresses right now.
 
 **listen**="/var/run/crio/crio.sock"
   Path to AF_LOCAL socket on which CRI-O will listen.
@@ -60,7 +64,7 @@ The `crio.api` table contains settings for the kubelet/gRPC interface.
   IP address on which the stream server will listen.
 
 **stream_port**="0"
-  The port on which the stream server will listen.
+  The port on which the stream server will listen. If the port is set to "0", then CRI-O will allocate a random free port number.
 
 **stream_enable_tls**=false
   Enable encrypted TLS transport of the stream server.
@@ -83,11 +87,11 @@ The `crio.api` table contains settings for the kubelet/gRPC interface.
 ## CRIO.RUNTIME TABLE
 The `crio.runtime` table contains settings pertaining to the OCI runtime used and options for how to set up and manage the OCI runtime.
 
-**default_ulimits**=[]
-  A list of ulimits to be set in containers by default, specified as "<ulimit name>=<soft limit>:<hard limit>", for example:"nofile=1024:2048". If nothing is set here, settings will be inherited from the CRI-O daemon.
-
 **default_runtime**="runc"
   The _name_ of the OCI runtime to be used as the default.
+
+**default_ulimits**=[]
+  A list of ulimits to be set in containers by default, specified as "<ulimit name>=<soft limit>:<hard limit>", for example:"nofile=1024:2048". If nothing is set here, settings will be inherited from the CRI-O daemon.
 
 **no_pivot**=false
   If true, the runtime will not use `pivot_root`, but instead use `MS_MOVE`.
@@ -104,6 +108,10 @@ The `crio.runtime` table contains settings pertaining to the OCI runtime used an
 **conmon_env**=["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
   Environment variable list for the conmon process, used for passing necessary environment variables to conmon or the runtime.
 
+**default_env**=[]
+  Additional environment variables to set for all the containers. These are overridden if set in the container image spec or in
+the container runtime configuration.
+
 **selinux**=false
   If true, SELinux will be used for pod separation on the host.
 
@@ -111,9 +119,9 @@ The `crio.runtime` table contains settings pertaining to the OCI runtime used an
   Path to the seccomp.json profile which is used as the default seccomp profile for the runtime. If not specified, then the internal default seccomp profile will be used.
 
 **apparmor_profile**=""
-  Used to change the name of the default AppArmor profile of CRI-O. The default profile name is "crio-default-" followed by the version string of CRI-O.
+  Used to change the name of the default AppArmor profile of CRI-O. The default profile name is "crio-default".
 
-**cgroup_manager**="cgroupfs"
+**cgroup_manager**="systemd"
   Cgroup management implementation used for the runtime.
 
 **default_capabilities**=[]
@@ -122,22 +130,27 @@ The `crio.runtime` table contains settings pertaining to the OCI runtime used an
   The default list is:
 ```
   default_capabilities = [
-          "CHOWN",
-          "DAC_OVERRIDE",
-          "FSETID",
-          "FOWNER",
-          "NET_RAW",
-          "SETGID",
-          "SETUID",
-          "SETPCAP",
-          "NET_BIND_SERVICE",
-          "SYS_CHROOT",
-          "KILL",
+	  "CHOWN",
+	  "DAC_OVERRIDE",
+	  "FSETID",
+	  "FOWNER",
+	  "SETGID",
+	  "SETUID",
+	  "SETPCAP",
+	  "NET_BIND_SERVICE",
+	  "KILL",
   ]
 ```
 
 **default_sysctls**=[]
  List of default sysctls. If it is empty or commented out, only the sysctls defined in the container json file by the user/kube will be added.
+
+  One example would be allowing ping inside of containers.  On systems that support `/proc/sys/net/ipv4/ping_group_range`, the default list could be:
+```
+  default_sysctls = [
+       "net.ipv4.ping_group_range" = "0   2147483647",
+  ]
+```
 
 **additional_devices**=[]
   List of additional devices. Specified as "<device-on-host>:<device-on-container>:<permissions>", for example: "--additional-devices=/dev/sdc:/dev/xvdc:rwm". If it is empty or commented out, only the devices defined in the container json file by the user/kube will be added.
@@ -161,13 +174,18 @@ The `crio.runtime` table contains settings pertaining to the OCI runtime used an
 
     2) `/usr/share/containers/mounts.conf`: This is the default file read for mounts. If you want CRI-O to read from a different, specific mounts file, you can change the default_mounts_file. Note, if this is done, CRI-O will only add mounts it finds in this file.
 
+**bind_mount_prefix**="prefix"
+  A prefix to use for the source of the bind mounts.
+
+  One potential use for this option would be running CRI-O in a container, and mounting / on the host as /host in the container.  CRI-O could then be ran with --bind-mount-prefix=/host, and CRI-O would add /host to any bind mounts it hands over the CRI, thus specifying the correct directory on the host.
+
 **pids_limit**=1024
   Maximum number of processes allowed in a container.
 
 **log_filter**=""
   Filter the log messages by the provided regular expression. This option supports live configuration reload. For example 'request:.*' filters all gRPC requests.
 
-**log_level**="error"
+**log_level**="info"
   Changes the verbosity of the logs based on the level it is set to. Options are fatal, panic, error, warn, info, and debug. This option supports live configuration reload.
 
 **log_size_max**=-1
@@ -194,17 +212,29 @@ The `crio.runtime` table contains settings pertaining to the OCI runtime used an
 **gid_mappings**=""
   The GID mappings for the user namespace of each container. A range is specified in the form containerGID:HostGID:Size. Multiple ranges must be separated by comma.
 
-**ctr_stop_timeout**=0
+**ctr_stop_timeout**=30
   The minimal amount of time in seconds to wait before issuing a timeout regarding the proper termination of the container.
 
-**manage_network_ns_lifecycle**=false
-  ManageNetworkNSLifecycle determines whether we pin and remove network namespace and manage its lifecycle.
+**manage_ns_lifecycle**=true
+  Determines whether we pin and remove namespaces and manage their lifecycle.
+
+**namespaces_dir**="/var/run"
+  The directory where the state of the managed namespaces gets tracked. Only used when manage_ns_lifecycle is true
+
+**pinns_path**=""
+  The path to find the pinns binary, which is needed to manage namespace lifecycle
 
 ### CRIO.RUNTIME.RUNTIMES TABLE
 The "crio.runtime.runtimes" table defines a list of OCI compatible runtimes.  The runtime to use is picked based on the runtime_handler provided by the CRI.  If no runtime_handler is provided, the runtime will be picked based on the level of trust of the workload.
 
 **runtime_path**=""
   Path to the OCI compatible runtime used for this runtime handler.
+
+**runtime_root**=""
+  Root directory used to store runtime data
+
+**runtime_type**="oci"
+  Type of the runtime used for this runtime handler. "oci", "vm"
 
 ## CRIO.IMAGE TABLE
 The `crio.image` table contains settings pertaining to the management of OCI images.
@@ -217,7 +247,7 @@ CRI-O reads its configured registries defaults from the system wide containers-r
 **global_auth_file**=""
   The path to a file like /var/lib/kubelet/config.json holding credentials necessary for pulling images from secure registries.
 
-**pause_image**="k8s.gcr.io/pause:3.1"
+**pause_image**="k8s.gcr.io/pause:3.2"
   The image used to instantiate infra containers. This option supports live configuration reload.
 
 **pause_image_auth_file**=""
@@ -238,9 +268,15 @@ CRI-O reads its configured registries defaults from the system wide containers-r
 **registries**=["docker.io"]
   List of registries to be used when pulling an unqualified image (e.g., "alpine:latest"). By default, registries is set to "docker.io" for compatibility reasons. Depending on your workload and usecase you may add more registries (e.g., "quay.io", "registry.fedoraproject.org", "registry.opensuse.org", etc.).
 
+**big_files_temporary_dir**=""
+  Path to the temporary directory to use for storing big files, used to store image blobs and data streams related to containers image management.
+
 
 ## CRIO.NETWORK TABLE
 The `crio.network` table containers settings pertaining to the management of CNI plugins.
+
+**cni_default_network**=""
+  The default CNI network name to be selected. If not set or "", then CRI-O will pick-up the first one found in network_dir.
 
 **network_dir**="/etc/cni/net.d/"
   Path to the directory where CNI configuration files are located.
@@ -257,8 +293,11 @@ The `crio.metrics` table containers settings pertaining to the Prometheus based 
 **metrics_port**=9090
   The port on which the metrics server will listen.
 
+**metrics_socket**=""
+  The socket on which the metrics server will listen.
+
 # SEE ALSO
-containers-storage.conf(5), containers-policy.json(5), containers-registries.conf(5), crio(8)
+crio.conf.d(5), containers-storage.conf(5), containers-policy.json(5), containers-registries.conf(5), crio(8)
 
 # HISTORY
 Aug 2018, Update to the latest state by Valentin Rothberg <vrothberg@suse.com>

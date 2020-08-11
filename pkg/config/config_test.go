@@ -4,6 +4,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/cri-o/cri-o/pkg/config"
 
@@ -15,10 +16,12 @@ import (
 var _ = t.Describe("Config", func() {
 	BeforeEach(beforeEach)
 
-	var runtimeValidConfig = func() *config.Config {
+	runtimeValidConfig := func() *config.Config {
 		sut.Runtimes["runc"] = &config.RuntimeHandler{
 			RuntimePath: validFilePath, RuntimeType: config.DefaultRuntimeType,
 		}
+		sut.PinnsPath = validFilePath
+		sut.NamespacesDir = os.TempDir()
 		sut.Conmon = validFilePath
 		tmpDir := t.MustTempDir("cni-test")
 		sut.NetworkConfig.PluginDirs = []string{tmpDir}
@@ -33,7 +36,7 @@ var _ = t.Describe("Config", func() {
 		It("should succeed with default config", func() {
 			// Given
 			// When
-			err := sut.Validate(nil, false)
+			err := sut.Validate(false)
 
 			// Then
 			Expect(err).To(BeNil())
@@ -44,7 +47,7 @@ var _ = t.Describe("Config", func() {
 			sut = runtimeValidConfig()
 
 			// When
-			err := sut.Validate(nil, true)
+			err := sut.Validate(true)
 
 			// Then
 			Expect(err).To(BeNil())
@@ -55,7 +58,7 @@ var _ = t.Describe("Config", func() {
 			sut.RootConfig.LogDir = "/dev/null"
 
 			// When
-			err := sut.Validate(nil, true)
+			err := sut.Validate(true)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -67,7 +70,7 @@ var _ = t.Describe("Config", func() {
 			sut.Listen = "/proc"
 
 			// When
-			err := sut.Validate(nil, true)
+			err := sut.Validate(true)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -78,7 +81,7 @@ var _ = t.Describe("Config", func() {
 			sut.AdditionalDevices = []string{invalidPath}
 
 			// When
-			err := sut.Validate(nil, true)
+			err := sut.Validate(true)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -91,7 +94,7 @@ var _ = t.Describe("Config", func() {
 			sut.NetworkConfig.NetworkDir = invalidPath
 
 			// When
-			err := sut.Validate(nil, true)
+			err := sut.Validate(true)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -102,7 +105,7 @@ var _ = t.Describe("Config", func() {
 			sut.ImageVolumes = invalidPath
 
 			// When
-			err := sut.Validate(nil, false)
+			err := sut.Validate(false)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -113,12 +116,11 @@ var _ = t.Describe("Config", func() {
 			sut.DefaultUlimits = []string{"invalid=-1:-1"}
 
 			// When
-			err := sut.Validate(nil, false)
+			err := sut.Validate(false)
 
 			// Then
 			Expect(err).NotTo(BeNil())
 		})
-
 	})
 
 	t.Describe("ValidateAPIConfig", func() {
@@ -167,30 +169,6 @@ var _ = t.Describe("Config", func() {
 			// Then
 			Expect(err).NotTo(BeNil())
 		})
-
-		It("should fail with invalid host IP", func() {
-			// Given
-			sut = runtimeValidConfig()
-			sut.HostIP = []string{"1.2.3.4", "invalid"}
-
-			// When
-			err := sut.APIConfig.Validate(true)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
-
-		It("should fail with more than two host IPs", func() {
-			// Given
-			sut = runtimeValidConfig()
-			sut.HostIP = []string{"1.2.3.4", "10.1.2.3", "3300::1"}
-
-			// When
-			err := sut.APIConfig.Validate(true)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
 	})
 
 	t.Describe("ValidateRuntimeConfig", func() {
@@ -232,40 +210,49 @@ var _ = t.Describe("Config", func() {
 				RuntimePath: validFilePath,
 				RuntimeType: config.DefaultRuntimeType,
 			}
+			sut.PinnsPath = validFilePath
+			sut.NamespacesDir = os.TempDir()
 			sut.Conmon = validFilePath
-			sut.HooksDir = []string{validDirPath}
+			sut.HooksDir = []string{validDirPath, validDirPath, validDirPath}
 
 			// When
 			err := sut.RuntimeConfig.Validate(nil, true)
 
 			// Then
 			Expect(err).To(BeNil())
+			Expect(sut.HooksDir).To(HaveLen(3))
 		})
 
-		It("should fail on invalid hooks directory", func() {
+		It("should sort out invalid hooks directories", func() {
 			// Given
 			sut.Runtimes["runc"] = &config.RuntimeHandler{RuntimePath: validFilePath}
 			sut.Conmon = validFilePath
-			sut.HooksDir = []string{invalidPath}
+			sut.PinnsPath = validFilePath
+			sut.NamespacesDir = os.TempDir()
+			sut.HooksDir = []string{invalidPath, validDirPath, validDirPath}
 
 			// When
 			err := sut.RuntimeConfig.Validate(nil, true)
 
 			// Then
-			Expect(err).NotTo(BeNil())
+			Expect(err).To(BeNil())
+			Expect(sut.HooksDir).To(HaveLen(2))
 		})
 
-		It("should fail if the hooks directory is not a directory", func() {
+		It("should create non-existent hooks directory", func() {
 			// Given
 			sut.Runtimes["runc"] = &config.RuntimeHandler{RuntimePath: validFilePath}
 			sut.Conmon = validFilePath
-			sut.HooksDir = []string{validFilePath}
+			sut.PinnsPath = validFilePath
+			sut.NamespacesDir = os.TempDir()
+			sut.HooksDir = []string{filepath.Join(validDirPath, "new")}
 
 			// When
 			err := sut.RuntimeConfig.Validate(nil, true)
 
 			// Then
-			Expect(err).NotTo(BeNil())
+			Expect(err).To(BeNil())
+			Expect(sut.HooksDir).To(HaveLen(1))
 		})
 
 		It("should fail on invalid conmon path", func() {
@@ -372,10 +359,10 @@ var _ = t.Describe("Config", func() {
 		It("should fail wrong UID mappings", func() {
 			// Given
 			sut.UIDMappings = "value"
-			sut.ManageNetworkNSLifecycle = true
+			sut.ManageNSLifecycle = true
 
 			// When
-			err := sut.Validate(nil, false)
+			err := sut.Validate(false)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -384,10 +371,10 @@ var _ = t.Describe("Config", func() {
 		It("should fail wrong GID mappings", func() {
 			// Given
 			sut.GIDMappings = "value"
-			sut.ManageNetworkNSLifecycle = true
+			sut.ManageNSLifecycle = true
 
 			// When
-			err := sut.Validate(nil, false)
+			err := sut.Validate(false)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -398,7 +385,7 @@ var _ = t.Describe("Config", func() {
 			sut.LogSizeMax = 1
 
 			// When
-			err := sut.Validate(nil, false)
+			err := sut.Validate(false)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -438,6 +425,28 @@ var _ = t.Describe("Config", func() {
 			// Then
 			Expect(err).To(BeNil())
 			Expect(sut.DefaultRuntime).To(Equal("runc"))
+		})
+
+		It("should fail on invalid default_sysctls", func() {
+			// Given
+			sut.DefaultSysctls = []string{"invalid"}
+
+			// When
+			err := sut.RuntimeConfig.Validate(nil, false)
+
+			// Then
+			Expect(err).NotTo(BeNil())
+		})
+
+		It("should fail on invalid conmon cgroup", func() {
+			// Given
+			sut.ConmonCgroup = "invalid"
+
+			// When
+			err := sut.RuntimeConfig.Validate(nil, false)
+
+			// Then
+			Expect(err).NotTo(BeNil())
 		})
 	})
 
@@ -690,7 +699,7 @@ var _ = t.Describe("Config", func() {
 			sut.RootConfig.LogDir = "test"
 
 			// When
-			err := sut.Validate(nil, true)
+			err := sut.Validate(true)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -724,15 +733,63 @@ var _ = t.Describe("Config", func() {
 	})
 
 	t.Describe("UpdateFromFile", func() {
-		It("should succeed with default config", func() {
+		It("should succeed with custom config", func() {
 			// Given
+			f := t.MustTempFile("config")
+			Expect(ioutil.WriteFile(f,
+				[]byte(`
+					[crio]
+					storage_driver = "overlay2"
+					[crio.runtime]
+					pids_limit = 2048`,
+				), 0),
+			).To(BeNil())
+
 			// When
-			err := sut.UpdateFromFile("testdata/config.toml")
+			err := sut.UpdateFromFile(f)
 
 			// Then
 			Expect(err).To(BeNil())
 			Expect(sut.Storage).To(Equal("overlay2"))
+			Expect(sut.Runtimes).To(HaveLen(1))
+			Expect(sut.Runtimes).To(HaveKey("runc"))
 			Expect(sut.PidsLimit).To(BeEquivalentTo(2048))
+		})
+
+		It("should succeed with custom runtime", func() {
+			// Given
+			f := t.MustTempFile("config")
+			Expect(ioutil.WriteFile(f,
+				[]byte("[crio.runtime.runtimes.crun]"), 0),
+			).To(BeNil())
+
+			// When
+			err := sut.UpdateFromFile(f)
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(sut.Runtimes).To(HaveLen(2))
+			Expect(sut.Runtimes).To(HaveKey("crun"))
+		})
+
+		It("should succeed with additional runtime", func() {
+			// Given
+			f := t.MustTempFile("config")
+			Expect(ioutil.WriteFile(f,
+				[]byte(`
+					[crio.runtime.runtimes.runc]
+					[crio.runtime.runtimes.crun]
+				`), 0),
+			).To(BeNil())
+
+			// When
+			err := sut.UpdateFromFile(f)
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(sut.Runtimes).To(HaveLen(2))
+			Expect(sut.Runtimes).To(HaveKey("crun"))
+			Expect(sut.Runtimes).To(HaveKey("runc"))
 		})
 
 		It("should fail when file does not exist", func() {
@@ -798,6 +855,57 @@ var _ = t.Describe("Config", func() {
 			// Then
 			Expect(err).To(BeNil())
 			Expect(res).NotTo(BeNil())
+		})
+	})
+
+	t.Describe("UpdateFromPath", func() {
+		It("should succeed with the correct priority", func() {
+			// Given
+			Expect(sut.LogLevel).To(Equal("info"))
+
+			configDir := t.MustTempDir("config-dir")
+			Expect(ioutil.WriteFile(
+				filepath.Join(configDir, "00-default"),
+				[]byte("[crio.runtime]\nlog_level = \"debug\"\n"),
+				0o644,
+			)).To(BeNil())
+			Expect(ioutil.WriteFile(
+				filepath.Join(configDir, "01-my-config"),
+				[]byte("[crio.runtime]\nlog_level = \"warning\"\n"),
+				0o644,
+			)).To(BeNil())
+
+			// When
+			err := sut.UpdateFromPath(configDir)
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(sut.LogLevel).To(Equal("warning"))
+		})
+
+		It("should fail with invalid config", func() {
+			// Given
+			configDir := t.MustTempDir("config-dir")
+			Expect(ioutil.WriteFile(
+				filepath.Join(configDir, "00-default"),
+				[]byte("[crio.runtime]\nlog_level = true\n"),
+				0o644,
+			)).To(BeNil())
+
+			// When
+			err := sut.UpdateFromPath(configDir)
+
+			// Then
+			Expect(err).NotTo(BeNil())
+		})
+
+		It("should succeed with not existing path", func() {
+			// Given
+			// When
+			err := sut.UpdateFromPath("not-existing")
+
+			// Then
+			Expect(err).To(BeNil())
 		})
 	})
 })

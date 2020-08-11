@@ -4,13 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -18,28 +16,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containers/image/v5/pkg/sysregistriesv2"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/libpod/pkg/apparmor"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/cri-o/cri-o/internal/lib"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/signals"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
 	libconfig "github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/cri-o/server/metrics"
-	"github.com/cri-o/cri-o/server/useragent"
-	"github.com/cri-o/ocicni/pkg/ocicni"
 	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	seccomp "github.com/seccomp/containers-golang"
 	"github.com/sirupsen/logrus"
-	knet "k8s.io/apimachinery/pkg/util/net"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/kubernetes/pkg/kubelet/cri/streaming"
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
-	"k8s.io/kubernetes/pkg/kubelet/server/streaming"
 	iptablesproxy "k8s.io/kubernetes/pkg/proxy/iptables"
 	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
 	utilexec "k8s.io/utils/exec"
@@ -48,6 +39,7 @@ import (
 const (
 	shutdownFile        = "/var/lib/crio/crio.shutdown"
 	certRefreshInterval = time.Minute * 5
+	rootlessEnvName     = "_CRIO_ROOTLESS"
 )
 
 // StreamService implements streaming.Runtime.
@@ -61,23 +53,41 @@ type StreamService struct {
 // Server implements the RuntimeService and ImageService
 type Server struct {
 	config          libconfig.Config
-	seccompProfile  *seccomp.Seccomp
 	stream          StreamService
-	netPlugin       ocicni.CNIPlugin
 	hostportManager hostport.HostPortManager
-
-	appArmorProfile    string
-	decryptionKeysPath string
 
 	*lib.ContainerServer
 	monitorsChan      chan struct{}
 	defaultIDMappings *idtools.IDMappings
-	systemContext     *types.SystemContext // Never nil
 
 	updateLock sync.RWMutex
 
-	seccompEnabled  bool
-	appArmorEnabled bool
+	// pullOperationsInProgress is used to avoid pulling the same image in parallel. Goroutines
+	// will block on the pullResult.
+	pullOperationsInProgress map[pullArguments]*pullOperation
+	// pullOperationsLock is used to synchronize pull operations.
+	pullOperationsLock sync.Mutex
+}
+
+// pullArguments are used to identify a pullOperation via an input image name and
+// possibly specified credentials.
+type pullArguments struct {
+	image       string
+	credentials types.DockerAuthConfig
+}
+
+// pullOperation is used to synchronize parallel pull operations via the
+// server's pullCache.  Goroutines can block the pullOperation's waitgroup and
+// be released once the pull operation has finished.
+type pullOperation struct {
+	// wg allows for Goroutines trying to pull the same image to wait until the
+	// currently running pull operation has finished.
+	wg sync.WaitGroup
+	// imageRef is the reference of the actually pulled image which will differ
+	// from the input if it was a short name (e.g., alpine).
+	imageRef string
+	// err is the error indicating if the pull operation has succeeded or not.
+	err error
 }
 
 type certConfigCache struct {
@@ -141,9 +151,9 @@ func (s *Server) getPortForward(req *pb.PortForwardRequest) (*pb.PortForwardResp
 	return s.stream.streamServer.GetPortForward(req)
 }
 
-func (s *Server) restore() {
+func (s *Server) restore(ctx context.Context) {
 	containers, err := s.Store().Containers()
-	if err != nil && !os.IsNotExist(errors.Cause(err)) {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		logrus.Warnf("could not read containers and sandboxes: %v", err)
 	}
 	pods := map[string]*storage.RuntimeContainerMetadata{}
@@ -154,6 +164,10 @@ func (s *Server) restore() {
 		metadata, err2 := s.StorageRuntimeServer().GetContainerMetadata(containers[i].ID)
 		if err2 != nil {
 			logrus.Warnf("error parsing metadata for %s: %v, ignoring", containers[i].ID, err2)
+			continue
+		}
+		if !storage.IsCrioContainer(&metadata) {
+			logrus.Debugf("container %s determined to not be a CRI-O container or sandbox", containers[i].ID)
 			continue
 		}
 		names[containers[i].ID] = containers[i].Names
@@ -203,26 +217,35 @@ func (s *Server) restore() {
 	// release the name associated with you.
 	for containerID := range podContainers {
 		if err := s.LoadContainer(containerID); err != nil {
-			logrus.Warnf("could not restore container %s: %v", containerID, err)
-			for _, n := range names[containerID] {
-				if err := s.Store().DeleteContainer(n); err != nil {
-					logrus.Warnf("unable to delete container %s: %v", n, err)
+			// containers of other runtimes should not be deleted
+			if err == lib.ErrIsNonCrioContainer {
+				logrus.Infof("ignoring non CRI-O container %s", containerID)
+			} else {
+				logrus.Warnf("could not restore container %s: %v", containerID, err)
+				for _, n := range names[containerID] {
+					if err := s.Store().DeleteContainer(n); err != nil {
+						logrus.Warnf("unable to delete container %s: %v", n, err)
+					}
+					// Release the container name
+					s.ReleaseContainerName(n)
 				}
-				// Release the container name
-				s.ReleaseContainerName(n)
 			}
 		}
 	}
 
 	// Restore sandbox IPs
 	for _, sb := range s.ListSandboxes() {
-		// Move on if pod was deleted
+		// Clean up networking if pod couldn't be restored and was deleted
 		if ok := deletedPods[sb.ID()]; ok {
+			if err := s.networkStop(ctx, sb); err != nil {
+				logrus.Warnf("error stopping network on restore cleanup %v:", err)
+			}
 			continue
 		}
 		ips, err := s.getSandboxIPs(sb)
 		if err != nil {
 			logrus.Warnf("could not restore sandbox IP for %v: %v", sb.ID(), err)
+			continue
 		}
 		sb.AddIPs(ips)
 	}
@@ -249,7 +272,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// crio.service restart!!!
 	s.cleanupSandboxesOnShutdown(ctx)
 
-	s.ShutdownConmonmon()
 	return s.ContainerServer.Shutdown()
 }
 
@@ -287,12 +309,9 @@ func getIDMappings(config *libconfig.Config) (*idtools.IDMappings, error) {
 	return idtools.NewIDMappingsFromMaps(parsedUIDsMappings, parsedGIDsMappings), nil
 }
 
-// New creates a new Server with the provided context, systemContext,
-// configPath and configuration
+// New creates a new Server with the provided context and configuration
 func New(
 	ctx context.Context,
-	systemContext *types.SystemContext,
-	configPath string,
 	configIface libconfig.Iface,
 ) (*Server, error) {
 	if configIface == nil || configIface.GetData() == nil {
@@ -300,35 +319,23 @@ func New(
 	}
 	config := configIface.GetData()
 
-	// Make a copy of systemContext we can safely modify, and which is never nil. (Note that this is a shallow copy!)
-	sc := types.SystemContext{}
-	if systemContext != nil {
-		sc = *systemContext
-	}
-	systemContext = &sc
+	config.SystemContext.AuthFilePath = config.GlobalAuthFile
+	config.SystemContext.SignaturePolicyPath = config.SignaturePolicyPath
 
-	systemContext.AuthFilePath = config.GlobalAuthFile
-	systemContext.DockerRegistryUserAgent = useragent.Get(ctx)
-	systemContext.SignaturePolicyPath = config.SignaturePolicyPath
-
-	if err := os.MkdirAll(config.ContainerAttachSocketDir, 0755); err != nil {
+	if err := os.MkdirAll(config.ContainerAttachSocketDir, 0o755); err != nil {
 		return nil, err
 	}
 
 	// This is used to monitor container exits using inotify
-	if err := os.MkdirAll(config.ContainerExitsDir, 0755); err != nil {
+	if err := os.MkdirAll(config.ContainerExitsDir, 0o755); err != nil {
 		return nil, err
 	}
-	containerServer, err := lib.New(ctx, systemContext, configIface)
+	containerServer, err := lib.New(ctx, configIface)
 	if err != nil {
 		return nil, err
 	}
 
-	netPlugin, err := ocicni.InitCNI("", config.NetworkDir, config.PluginDirs...)
-	if err != nil {
-		return nil, err
-	}
-	iptInterface := utiliptables.New(utilexec.New(), utiliptables.ProtocolIpv4)
+	iptInterface := utiliptables.New(utilexec.New(), utiliptables.ProtocolIPv4)
 	if _, err := iptInterface.EnsureChain(utiliptables.TableNAT, iptablesproxy.KubeMarkMasqChain); err != nil {
 		logrus.Warnf("unable to ensure iptables chain: %v", err)
 	}
@@ -339,73 +346,32 @@ func New(
 		return nil, err
 	}
 
+	if os.Getenv(rootlessEnvName) == "" {
+		// Not running as rootless, reset XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+		os.Unsetenv("XDG_RUNTIME_DIR")
+		os.Unsetenv("DBUS_SESSION_BUS_ADDRESS")
+	}
+
 	s := &Server{
-		ContainerServer:   containerServer,
-		netPlugin:         netPlugin,
-		hostportManager:   hostportManager,
-		config:            *config,
-		seccompEnabled:    seccomp.IsEnabled(),
-		appArmorEnabled:   apparmor.IsEnabled(),
-		appArmorProfile:   config.ApparmorProfile,
-		monitorsChan:      make(chan struct{}),
-		defaultIDMappings: idMappings,
-		systemContext:     systemContext,
-	}
-
-	s.decryptionKeysPath = config.DecryptionKeysPath
-
-	if s.seccompEnabled {
-		if config.SeccompProfile != "" {
-			seccompProfile, fileErr := ioutil.ReadFile(config.SeccompProfile)
-			if fileErr != nil {
-				return nil, fmt.Errorf("opening seccomp profile (%s) failed: %v",
-					config.SeccompProfile, fileErr)
-			}
-			var seccompConfig seccomp.Seccomp
-			if jsonErr := json.Unmarshal(seccompProfile, &seccompConfig); jsonErr != nil {
-				return nil, fmt.Errorf("decoding seccomp profile failed: %v", jsonErr)
-			}
-			logrus.Infof("using seccomp profile %q", config.SeccompProfile)
-			s.seccompProfile = &seccompConfig
-		} else {
-			logrus.Infof("no seccomp profile specified, using the internal default")
-			s.seccompProfile = seccomp.DefaultProfile()
-		}
-	}
-
-	if s.appArmorEnabled && config.ApparmorProfile == libconfig.DefaultApparmorProfile {
-		logrus.Infof("installing default apparmor profile: %v", libconfig.DefaultApparmorProfile)
-		if err := apparmor.InstallDefault(libconfig.DefaultApparmorProfile); err != nil {
-			return nil, errors.Wrapf(err,
-				"installing default apparmor profile %q failed",
-				libconfig.DefaultApparmorProfile,
-			)
-		}
-		if logrus.IsLevelEnabled(logrus.TraceLevel) {
-			profileContent, err := apparmor.DefaultContent(libconfig.DefaultApparmorProfile)
-			if err != nil {
-				return nil, errors.Wrapf(err,
-					"retrieving default apparmor profile %q content failed",
-					libconfig.DefaultApparmorProfile,
-				)
-			}
-			logrus.Tracef("default apparmor profile contents: %s", profileContent)
-		}
-	} else {
-		logrus.Infof("assuming user-provided apparmor profile: %v", config.ApparmorProfile)
+		ContainerServer:          containerServer,
+		hostportManager:          hostportManager,
+		config:                   *config,
+		monitorsChan:             make(chan struct{}),
+		defaultIDMappings:        idMappings,
+		pullOperationsInProgress: make(map[pullArguments]*pullOperation),
 	}
 
 	if err := configureMaxThreads(); err != nil {
 		return nil, err
 	}
 
-	s.restore()
+	s.restore(ctx)
 	s.cleanupSandboxesOnShutdown(ctx)
 
+	var bindAddressStr string
 	bindAddress := net.ParseIP(config.StreamAddress)
-	if bindAddress == nil {
-		hostIPs := s.getHostIPs(config.HostIP)
-		bindAddress = hostIPs[0]
+	if bindAddress != nil {
+		bindAddressStr = bindAddress.String()
 	}
 
 	_, err = net.LookupPort("tcp", config.StreamPort)
@@ -415,7 +381,7 @@ func New(
 
 	// Prepare streaming server
 	streamServerConfig := streaming.DefaultConfig
-	streamServerConfig.Addr = net.JoinHostPort(bindAddress.String(), config.StreamPort)
+	streamServerConfig.Addr = net.JoinHostPort(bindAddressStr, config.StreamPort)
 	if config.StreamEnableTLS {
 		certCache := &certConfigCache{
 			tlsCert: config.StreamTLSCert,
@@ -444,24 +410,14 @@ func New(
 	go func() {
 		defer close(s.stream.streamServerCloseCh)
 		if err := s.stream.streamServer.Start(true); err != nil && err != http.ErrServerClosed {
-			logrus.Errorf("Failed to start streaming server: %v", err)
+			logrus.Fatalf("Failed to start streaming server: %v", err)
 		}
 	}()
 
 	logrus.Debugf("sandboxes: %v", s.ContainerServer.ListSandboxes())
 
 	// Start a configuration watcher for the default config
-	if _, err := s.StartConfigWatcher(configPath, s.config.Reload); err != nil {
-		logrus.Warnf("unable to start config watcher for file %q: %v",
-			configPath, err)
-	}
-
-	// Start a configuration watcher for the registries of the SystemContext
-	registriesPath := sysregistriesv2.ConfigPath(s.systemContext)
-	if _, err := s.StartConfigWatcher(registriesPath, s.ReloadRegistries); err != nil {
-		logrus.Warnf("unable to start config watcher for file %q: %v",
-			registriesPath, err)
-	}
+	s.config.StartWatcher()
 
 	// Start the metrics server if configured to be enabled
 	if err := s.startMetricsServer(); err != nil {
@@ -469,83 +425,6 @@ func New(
 	}
 
 	return s, nil
-}
-
-func (s *Server) getHostIPs(configIPs []string) []net.IP {
-	// emulate kubelet behavior of choosing hostIP
-	// ref: k8s/pkg/kubelet/nodestatus/setters.go
-	ips := []net.IP{}
-
-	// use configured value if set
-	for _, ip := range configIPs {
-		// The configuration validation already ensures valid IPs
-		ips = append(ips, net.ParseIP(ip))
-	}
-	// Abort if the maximum amount of adresses is already specified
-	if len(ips) > 1 {
-		return ips
-	}
-
-	// Otherwise use kubernetes utility to choose hostIP
-	// there exists the chance for both hostIP and err to be nil, so check both
-	if len(ips) == 0 {
-		if hostIP, err := knet.ChooseHostInterface(); err != nil && hostIP != nil {
-			ips = append(ips, hostIP)
-		}
-	}
-
-	// attempt to find an IP from the hostname
-	if len(ips) == 0 {
-		if hostname, err := os.Hostname(); err == nil {
-			if hostIP := net.ParseIP(hostname); hostIP != nil && validateHostIP(hostIP) == nil {
-				ips = append(ips, hostIP)
-			}
-		}
-	}
-
-	// if that fails, check if we can find a primary IP address unambiguously
-	if len(ips) == 0 {
-		if allAddrs, err := net.InterfaceAddrs(); err == nil {
-			for _, addr := range allAddrs {
-				if ipnet, ok := addr.(*net.IPNet); ok {
-					if validateHostIP(ipnet.IP) == nil {
-						ips = append(ips, ipnet.IP)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	if len(ips) == 0 {
-		ips = append(ips, net.IPv4(127, 0, 0, 1))
-		logrus.Warnf("unable to find a host IP, falling back to: %v", ips)
-	}
-
-	// Search for an additional IP
-	if ifaces, err := net.Interfaces(); err == nil {
-		for _, iface := range ifaces {
-			if addrs, err := iface.Addrs(); err == nil {
-				searchThisInterface := false
-				for _, addr := range addrs {
-					if ipnet, ok := addr.(*net.IPNet); ok {
-						ip := ipnet.IP
-						if ip.Equal(ips[0]) {
-							searchThisInterface = true
-						}
-						if searchThisInterface &&
-							!ip.Equal(ips[0]) &&
-							ip.IsGlobalUnicast() {
-							ips = append(ips, ipnet.IP)
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return ips
 }
 
 func (s *Server) addSandbox(sb *sandbox.Sandbox) error {
@@ -598,21 +477,49 @@ func (s *Server) getPodSandboxFromRequest(podSandboxID string) (*sandbox.Sandbox
 }
 
 func (s *Server) startMetricsServer() error {
-	if s.config.EnableMetrics {
-		me, err := s.CreateMetricsEndpoint()
-		if err != nil {
-			return errors.Wrapf(err, "failed to create metrics endpoint")
-		}
-		l, err := net.Listen("tcp", fmt.Sprintf(":%v", s.config.MetricsPort))
-		if err != nil {
-			return errors.Wrapf(err, "failed to create listener for metrics")
-		}
-		go func() {
-			if err := http.Serve(l, me); err != nil {
-				logrus.Fatalf("failed to serve metrics endpoint: %v", err)
-			}
-		}()
+	if !s.config.EnableMetrics {
+		return nil
 	}
+
+	me, err := s.CreateMetricsEndpoint()
+	if err != nil {
+		return errors.Wrap(err, "failed to create metrics endpoint")
+	}
+
+	if err := startMetricsEndpoint(
+		"tcp", fmt.Sprintf(":%v", s.config.MetricsPort), me,
+	); err != nil {
+		return errors.Wrap(err, "creating tcp metrics endpoint")
+	}
+
+	metricsSocket := s.config.MetricsSocket
+	if metricsSocket != "" {
+		if err := libconfig.RemoveUnusedSocket(metricsSocket); err != nil {
+			return errors.Wrapf(err, "removing ununsed socket %s", metricsSocket)
+		}
+
+		return errors.Wrap(
+			startMetricsEndpoint("unix", s.config.MetricsSocket, me),
+			"creating path metrics endpoint",
+		)
+	}
+
+	return nil
+}
+
+func startMetricsEndpoint(network, address string, me *http.ServeMux) error {
+	l, err := net.Listen(network, address)
+	if err != nil {
+		return errors.Wrap(err, "creating listener")
+	}
+
+	go func() {
+		logrus.Infof("Serving metrics on %s", address)
+		if err := http.Serve(l, me); err != nil {
+			logrus.Fatalf("failed to serve metrics endpoint %v: %v", l, err)
+		}
+	}()
+
 	return nil
 }
 
@@ -682,6 +589,7 @@ func (s *Server) StartExitMonitor() {
 				}
 			case err := <-watcher.Errors:
 				logrus.Debugf("watch error: %v", err)
+				close(done)
 				return
 			case <-s.monitorsChan:
 				logrus.Debug("closing exit monitor...")
@@ -695,50 +603,4 @@ func (s *Server) StartExitMonitor() {
 		close(done)
 	}
 	<-done
-}
-
-// StartConfigWatcher starts a new watching go routine for the provided
-// `fileName` and `reloadFunc`. The method errors if the given fileName does
-// not exist or is not accessible.
-func (s *Server) StartConfigWatcher(
-	fileName string,
-	reloadFunc func(string) error,
-) (chan os.Signal, error) {
-	// Validate the arguments
-	if _, err := os.Stat(fileName); err != nil {
-		return nil, err
-	}
-	if reloadFunc == nil {
-		return nil, fmt.Errorf("provided reload closure is nil")
-	}
-
-	// Setup the signal notifier
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, signals.Hup)
-
-	go func() {
-		for {
-			// Block until the signal is received
-			<-c
-			logrus.Infof("reloading configuration %q", fileName)
-			if err := reloadFunc(fileName); err != nil {
-				logrus.Errorf("unable to reload configuration: %v", err)
-				continue
-			}
-		}
-	}()
-
-	logrus.Debugf("registered SIGHUP watcher for file %q", fileName)
-	return c, nil
-}
-
-// ReloadRegistries reloads the registry configuration from the servers
-// `SystemContext`. The method errors in case of any update failure.
-func (s *Server) ReloadRegistries(file string) error {
-	registries, err := sysregistriesv2.TryUpdatingCache(s.systemContext)
-	if err != nil {
-		return errors.Wrapf(err, "system registries reload failed: %s", file)
-	}
-	logrus.Infof("applied new registry configuration: %+v", registries)
-	return nil
 }

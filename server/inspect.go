@@ -1,8 +1,6 @@
 package server
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -12,6 +10,8 @@ import (
 	"github.com/cri-o/cri-o/internal/oci"
 	"github.com/cri-o/cri-o/pkg/types"
 	"github.com/go-zoo/bone"
+	json "github.com/json-iterator/go"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -42,7 +42,7 @@ func (s *Server) getInfo() types.CrioInfo {
 	return types.CrioInfo{
 		StorageDriver:     s.config.Storage,
 		StorageRoot:       s.config.Root,
-		CgroupDriver:      s.config.CgroupManager,
+		CgroupDriver:      s.config.CgroupManager().Name(),
 		DefaultIDMappings: s.getIDMappingsInfo(),
 	}
 }
@@ -73,7 +73,7 @@ func (s *Server) getContainerInfo(id string, getContainerFunc, getInfraContainer
 	}
 	image := ctr.Image()
 	if s.ContainerServer != nil && s.ContainerServer.StorageImageServer() != nil {
-		if status, err := s.ContainerServer.StorageImageServer().ImageStatus(s.systemContext, ctr.ImageRef()); err == nil {
+		if status, err := s.ContainerServer.StorageImageServer().ImageStatus(s.config.SystemContext, ctr.ImageRef()); err == nil {
 			image = status.Name
 		}
 	}

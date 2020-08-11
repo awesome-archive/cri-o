@@ -7,14 +7,15 @@ import (
 	"github.com/opencontainers/runtime-tools/generate"
 )
 
-func hasNamespace(config *rspec.Spec, ns string) bool {
+func hasNetworkNamespace(config *rspec.Spec) bool {
 	for _, n := range config.Linux.Namespaces {
-		if string(n.Type) == ns {
+		if n.Type == rspec.NetworkNamespace {
 			return true
 		}
 	}
 	return false
 }
+
 func makeOCIConfigurationRootless(g *generate.Generator) {
 	g.Config.Linux.Resources = nil
 	g.Config.Process.OOMScoreAdj = nil
@@ -31,7 +32,7 @@ func makeOCIConfigurationRootless(g *generate.Generator) {
 		g.Config.Mounts[i].Options = newOptions
 	}
 
-	if !hasNamespace(g.Config, rspec.NetworkNamespace) {
+	if !hasNetworkNamespace(g.Config) {
 		g.RemoveMount("/sys")
 		sysMnt := rspec.Mount{
 			Destination: "/sys",

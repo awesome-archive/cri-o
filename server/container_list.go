@@ -1,8 +1,10 @@
 package server
 
 import (
-	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/log"
+	"strings"
+
+	"github.com/cri-o/cri-o/internal/log"
+	oci "github.com/cri-o/cri-o/internal/oci"
 	"golang.org/x/net/context"
 	"k8s.io/apimachinery/pkg/fields"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
@@ -35,33 +37,33 @@ func (s *Server) filterContainerList(ctx context.Context, filter *pb.ContainerFi
 		if err != nil {
 			// If we don't find a container ID with a filter, it should not
 			// be considered an error.  Log a warning and return an empty struct
-			log.Warnf(ctx, "unable to find container ID %s", filter.Id)
-			return []*oci.Container{}
+			log.Warnf(ctx, "Unable to find container ID %s", filter.Id)
+			return nil
 		}
 		c := s.ContainerServer.GetContainer(id)
 		if c != nil {
 			switch {
 			case filter.PodSandboxId == "":
 				return []*oci.Container{c}
-			case c.Sandbox() == filter.PodSandboxId:
+			case strings.HasPrefix(c.Sandbox(), filter.PodSandboxId):
 				return []*oci.Container{c}
 			default:
-				return []*oci.Container{}
+				return nil
 			}
 		}
 	} else if filter.PodSandboxId != "" {
-		pod := s.ContainerServer.GetSandbox(filter.PodSandboxId)
-		if pod == nil {
-			return []*oci.Container{}
+		sb, err := s.getPodSandboxFromRequest(filter.PodSandboxId)
+		if err != nil {
+			return nil
 		}
-		return pod.Containers().List()
+		return sb.Containers().List()
 	}
-	log.Debugf(ctx, "no filters were applied, returning full container list")
+	log.Debugf(ctx, "No filters were applied, returning full container list")
 	return origCtrList
 }
 
 // ListContainers lists all containers by filters.
-func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersRequest) (resp *pb.ListContainersResponse, err error) {
+func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersRequest) (*pb.ListContainersResponse, error) {
 	var ctrs []*pb.Container
 	filter := req.GetFilter()
 	ctrList, err := s.ContainerServer.ListContainers()
@@ -113,8 +115,7 @@ func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersReque
 		}
 	}
 
-	resp = &pb.ListContainersResponse{
+	return &pb.ListContainersResponse{
 		Containers: ctrs,
-	}
-	return resp, nil
+	}, nil
 }

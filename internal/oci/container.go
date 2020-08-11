@@ -1,10 +1,10 @@
 package oci
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -12,17 +12,22 @@ import (
 
 	"github.com/containers/libpod/pkg/cgroups"
 	"github.com/containers/storage/pkg/idtools"
-	"github.com/docker/docker/pkg/signal"
+	json "github.com/json-iterator/go"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/fields"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/types"
 )
 
-const (
-	defaultStopSignal    = "TERM"
-	defaultStopSignalInt = 15
+const defaultStopSignalInt = 15
+
+var (
+	defaultStopSignal   = strconv.Itoa(defaultStopSignalInt)
+	ErrContainerStopped = errors.New("container is already stopped")
+	ErrNotFound         = errors.New("container process not found")
 )
 
 // Container represents a runtime container.
@@ -33,7 +38,6 @@ type Container struct {
 	logPath        string
 	image          string
 	sandbox        string
-	netns          string
 	runtimeHandler string
 	// this is the /var/run/storage/... directory, erased on reboot
 	bundlePath string
@@ -56,7 +60,6 @@ type Container struct {
 	terminal           bool
 	stdin              bool
 	stdinOnce          bool
-	privileged         bool
 	created            bool
 }
 
@@ -73,13 +76,18 @@ type ContainerState struct {
 	Created   time.Time `json:"created"`
 	Started   time.Time `json:"started,omitempty"`
 	Finished  time.Time `json:"finished,omitempty"`
-	ExitCode  int32     `json:"exitCode,omitempty"`
+	ExitCode  *int32    `json:"exitCode,omitempty"`
 	OOMKilled bool      `json:"oomKilled,omitempty"`
 	Error     string    `json:"error,omitempty"`
+	InitPid   int       `json:"initPid,omitempty"`
+	// The unix start time of the container's init PID.
+	// This is used to track whether the PID we have stored
+	// is the same as the corresponding PID on the host.
+	InitStartTime int `json:"initStartTime,omitempty"`
 }
 
 // NewContainer creates a container object.
-func NewContainer(id, name, bundlePath, logPath, netns string, labels, crioAnnotations, annotations map[string]string, image, imageName, imageRef string, metadata *pb.ContainerMetadata, sandbox string, terminal, stdin, stdinOnce, privileged bool, runtimeHandler, dir string, created time.Time, stopSignal string) (*Container, error) {
+func NewContainer(id, name, bundlePath, logPath string, labels, crioAnnotations, annotations map[string]string, image, imageName, imageRef string, metadata *pb.ContainerMetadata, sandbox string, terminal, stdin, stdinOnce bool, runtimeHandler, dir string, created time.Time, stopSignal string) (*Container, error) {
 	state := &ContainerState{}
 	state.Created = created
 	c := &Container{
@@ -89,11 +97,9 @@ func NewContainer(id, name, bundlePath, logPath, netns string, labels, crioAnnot
 		logPath:         logPath,
 		labels:          labels,
 		sandbox:         sandbox,
-		netns:           netns,
 		terminal:        terminal,
 		stdin:           stdin,
 		stdinOnce:       stdinOnce,
-		privileged:      privileged,
 		runtimeHandler:  runtimeHandler,
 		metadata:        metadata,
 		annotations:     annotations,
@@ -130,12 +136,13 @@ func (c *Container) GetStopSignal() string {
 	if c.stopSignal == "" {
 		return defaultStopSignal
 	}
-	cleanSignal := strings.TrimPrefix(strings.ToUpper(c.stopSignal), "SIG")
-	_, ok := signal.SignalMap[cleanSignal]
-	if !ok {
+	signal := unix.SignalNum(strings.ToUpper(c.stopSignal))
+	if signal == 0 {
 		return defaultStopSignal
 	}
-	return cleanSignal
+	// return the stop signal in the form of its int converted to a string
+	// i.e stop signal 34 is returned as "34" to avoid back and forth conversion
+	return strconv.Itoa(int(signal))
 }
 
 // StopSignal returns the container's own stop signal configured from
@@ -144,15 +151,21 @@ func (c *Container) StopSignal() syscall.Signal {
 	if c.stopSignal == "" {
 		return defaultStopSignalInt
 	}
-	cleanSignal := strings.TrimPrefix(strings.ToUpper(c.stopSignal), "SIG")
-	sig, ok := signal.SignalMap[cleanSignal]
-	if !ok {
+
+	signal := unix.SignalNum(strings.ToUpper(c.stopSignal))
+	if signal == 0 {
 		return defaultStopSignalInt
 	}
-	return sig
+	return signal
 }
 
 // FromDisk restores container's state from disk
+// Calls to FromDisk should always be preceded by call to Runtime.UpdateContainerStatus.
+// This is because FromDisk() initializes the InitStartTime for the saved container state
+// when CRI-O is being upgraded to a version that supports tracking PID,
+// but does no verification the container is actually still running. If we assume the container
+// is still running, we could incorrectly think a process with the same PID running on the host
+// is our container. A call to `$runtime state` will protect us against this.
 func (c *Container) FromDisk() error {
 	jsonSource, err := os.Open(c.StatePath())
 	if err != nil {
@@ -161,7 +174,37 @@ func (c *Container) FromDisk() error {
 	defer jsonSource.Close()
 
 	dec := json.NewDecoder(jsonSource)
-	return dec.Decode(c.state)
+	tmpState := &ContainerState{}
+	if err := dec.Decode(tmpState); err != nil {
+		return err
+	}
+
+	// this is to handle the situation in which we're upgrading
+	// versions of cri-o, and we didn't used to have this information in the state
+	if tmpState.InitPid == 0 && tmpState.InitStartTime == 0 && tmpState.Pid != 0 {
+		if err := tmpState.SetInitPid(tmpState.Pid); err != nil {
+			return err
+		}
+		logrus.Infof("PID information for container %s updated to %d %d", c.id, tmpState.InitPid, tmpState.InitStartTime)
+	}
+	c.state = tmpState
+	return nil
+}
+
+// SetInitPid initializes the InitPid and InitStartTime for the container state
+// given a PID.
+// These values should be set once, and not changed again.
+func (cstate *ContainerState) SetInitPid(pid int) error {
+	if cstate.InitPid != 0 || cstate.InitStartTime != 0 {
+		return errors.Errorf("pid and start time already initialized: %d %d", cstate.InitPid, cstate.InitStartTime)
+	}
+	cstate.InitPid = pid
+	startTime, err := getPidStartTime(pid)
+	if err != nil {
+		return err
+	}
+	cstate.InitStartTime = startTime
+	return nil
 }
 
 // StatePath returns the containers state.json path
@@ -181,6 +224,9 @@ func (c *Container) Name() string {
 
 // ID returns the id of the container.
 func (c *Container) ID() string {
+	if c == nil {
+		return ""
+	}
 	return c.id
 }
 
@@ -260,19 +306,6 @@ func (c *Container) Dir() string {
 	return c.dir
 }
 
-// NetNsPath returns the path to the network namespace of the container.
-func (c *Container) NetNsPath() (string, error) {
-	if c.state == nil {
-		return "", fmt.Errorf("container state is not populated")
-	}
-
-	if c.netns == "" {
-		return fmt.Sprintf("/proc/%d/ns/net", c.state.Pid), nil
-	}
-
-	return c.netns, nil
-}
-
 // Metadata returns the metadata of the container.
 func (c *Container) Metadata() *pb.ContainerMetadata {
 	return c.metadata
@@ -349,4 +382,90 @@ func (c *Container) Description() string {
 // StdinOnce returns whether stdin once is set for the container.
 func (c *Container) StdinOnce() bool {
 	return c.stdinOnce
+}
+
+func (c *Container) exitFilePath() string {
+	return filepath.Join(c.dir, "exit")
+}
+
+// IsAlive is a function that checks if a container's init PID exists.
+// It is used to check a container state when we don't want a `$runtime state` call
+func (c *Container) IsAlive() bool {
+	_, err := c.pid()
+	if err != nil {
+		logrus.Errorf("checking if PID of %s is running failed: %v", c.id, err)
+		return false
+	}
+
+	return true
+}
+
+// Pid returns the container's init PID.
+// It will fail if the saved PID no longer belongs to the container.
+func (c *Container) Pid() (int, error) {
+	c.opLock.Lock()
+	defer c.opLock.Unlock()
+	return c.pid()
+}
+
+// pid returns the container's init PID.
+// It checks that we have an InitPid defined in the state, that PID can be found
+// and it is the same process that was originally started by the runtime.
+func (c *Container) pid() (int, error) {
+	if c.state == nil {
+		return 0, errors.New("state not initialized")
+	}
+	if c.state.InitPid <= 0 {
+		return 0, errors.New("PID not initialized")
+	}
+
+	// container has stopped (as pid is initialized but the runc state has overwritten it)
+	if c.state.Pid == 0 {
+		return 0, ErrNotFound
+	}
+
+	if err := c.verifyPid(); err != nil {
+		return 0, err
+	}
+	return c.state.InitPid, nil
+}
+
+// verifyPid checks that the start time for the process on the node is the same
+// as the start time we saved after creating the container.
+// This is the simplest way to verify we are operating on the container
+// process, and haven't run into PID wrap.
+func (c *Container) verifyPid() error {
+	startTime, err := getPidStartTime(c.state.InitPid)
+	if err != nil {
+		return err
+	}
+
+	if startTime != c.state.InitStartTime {
+		return errors.New("PID running but not the original container. PID wrap may have occurred")
+	}
+	return nil
+}
+
+// getPidStartTime reads the kernel's /proc entry for stime for PID.
+func getPidStartTime(pid int) (int, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(fmt.Sprintf("/proc/%d", pid), &st); err != nil {
+		return 0, errors.Wrapf(ErrNotFound, err.Error())
+	}
+
+	return int(st.Ctim.Sec), nil
+}
+
+// ShouldBeStopped checks whether the container state is in a place
+// where attempting to stop it makes sense
+// a container is not stoppable if it's paused or stopped
+// if it's paused, that's an error, and is reported as such
+func (c *Container) ShouldBeStopped() error {
+	switch c.state.Status {
+	case ContainerStateStopped: // no-op
+		return ErrContainerStopped
+	case ContainerStatePaused:
+		return errors.New("cannot stop paused container")
+	}
+	return nil
 }

@@ -2,7 +2,6 @@ package server
 
 import (
 	"os"
-	"path"
 
 	"golang.org/x/net/context"
 	v1 "k8s.io/api/core/v1"
@@ -64,7 +63,7 @@ func (s *Server) runtimeHandler(req *pb.RunPodSandboxRequest) (string, error) {
 }
 
 // RunPodSandbox creates and runs a pod-level sandbox.
-func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest) (resp *pb.RunPodSandboxResponse, err error) {
+func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest) (*pb.RunPodSandboxResponse, error) {
 	// platform dependent call
 	return s.runPodSandbox(ctx, req)
 }
@@ -73,9 +72,6 @@ func convertPortMappings(in []*pb.PortMapping) []*hostport.PortMapping {
 	out := make([]*hostport.PortMapping, 0, len(in))
 	for _, v := range in {
 		if v.HostPort <= 0 {
-			continue
-		}
-		if v.Protocol != pb.Protocol_TCP && v.Protocol != pb.Protocol_UDP {
 			continue
 		}
 		out = append(out, &hostport.PortMapping{
@@ -112,35 +108,4 @@ func (s *Server) setPodSandboxMountLabel(id, mountLabel string) error {
 	}
 	storageMetadata.SetMountLabel(mountLabel)
 	return s.StorageRuntimeServer().SetContainerMetadata(id, &storageMetadata)
-}
-
-func getLabelOptions(selinuxOptions *pb.SELinuxOption) []string {
-	labels := []string{}
-	if selinuxOptions != nil {
-		if selinuxOptions.User != "" {
-			labels = append(labels, "user:"+selinuxOptions.User)
-		}
-		if selinuxOptions.Role != "" {
-			labels = append(labels, "role:"+selinuxOptions.Role)
-		}
-		if selinuxOptions.Type != "" {
-			labels = append(labels, "type:"+selinuxOptions.Type)
-		}
-		if selinuxOptions.Level != "" {
-			labels = append(labels, "level:"+selinuxOptions.Level)
-		}
-	}
-	return labels
-}
-
-// convertCgroupFsNameToSystemd converts an expanded cgroupfs name to its systemd name.
-// For example, it will convert test.slice/test-a.slice/test-a-b.slice to become test-a-b.slice
-// NOTE: this is public right now to allow its usage in dockermanager and dockershim, ideally both those
-// code areas could use something from libcontainer if we get this style function upstream.
-func convertCgroupFsNameToSystemd(cgroupfsName string) string {
-	// TODO: see if libcontainer systemd implementation could use something similar, and if so, move
-	// this function up to that library.  At that time, it would most likely do validation specific to systemd
-	// above and beyond the simple assumption here that the base of the path encodes the hierarchy
-	// per systemd convention.
-	return path.Base(cgroupfsName)
 }

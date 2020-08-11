@@ -16,6 +16,7 @@ function teardown() {
 	fi
 	export CONTAINER_UID_MAPPINGS="0:100000:100000"
 	export CONTAINER_GID_MAPPINGS="0:200000:100000"
+	export CONTAINER_MANAGE_NS_LIFECYCLE=false
 
 	# Workaround for https://github.com/opencontainers/runc/pull/1562
 	# Remove once the fix hits the CI
@@ -39,7 +40,7 @@ function teardown() {
 	echo "$output"
 	[ "$status" -eq 0 ]
 	state=$(crictl inspect "$ctr_id")
-	pid=$(echo $state | python -c 'import json; import sys; d=json.load(sys.stdin); print d["pid"]')
+	pid=$(echo $state | jq .info.pid)
 	grep 100000 /proc/$pid/uid_map
 	[ "$status" -eq 0 ]
 	grep 200000 /proc/$pid/gid_map

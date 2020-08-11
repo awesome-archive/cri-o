@@ -8,16 +8,20 @@ man
 markdown
 md
 config
+version
 wipe
 help
 h
 --additional-devices
 --apparmor-profile
+--big-files-temporary-dir
 --bind-mount-prefix
 --cgroup-manager
 --cni-config-dir
+--cni-default-network
 --cni-plugin-dir
 --config
+--config-dir
 --conmon
 --conmon-cgroup
 --conmon-env
@@ -26,7 +30,7 @@ h
 --ctr-stop-timeout
 --decryption-keys-path
 --default-capabilities
---default-mounts
+--default-env
 --default-mounts-file
 --default-runtime
 --default-sysctls
@@ -38,7 +42,6 @@ h
 --grpc-max-recv-msg-size
 --grpc-max-send-msg-size
 --hooks-dir
---host-ip
 --image-volumes
 --insecure-registry
 --listen
@@ -49,13 +52,16 @@ h
 --log-journald
 --log-level
 --log-size-max
---manage-network-ns-lifecycle
+--manage-ns-lifecycle
 --metrics-port
+--metrics-socket
+--namespaces-dir
 --no-pivot
 --pause-command
 --pause-image
 --pause-image-auth-file
 --pids-limit
+--pinns-path
 --profile
 --profile-port
 --read-only
@@ -78,6 +84,7 @@ h
 --stream-tls-key
 --uid-mappings
 --version-file
+--version-file-persist
 --help
 --version"
     COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )

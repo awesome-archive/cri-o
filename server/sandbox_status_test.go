@@ -24,7 +24,7 @@ var _ = t.Describe("PodSandboxStatus", func() {
 		It("should succeed", func() {
 			// Given
 			addContainerAndSandbox()
-			testContainer.SetState(&oci.ContainerState{
+			testContainer.SetStateAndSpoofPid(&oci.ContainerState{
 				State: specs.State{Status: oci.ContainerStateRunning},
 			})
 
@@ -70,6 +70,26 @@ var _ = t.Describe("PodSandboxStatus", func() {
 			// Then
 			Expect(err).NotTo(BeNil())
 			Expect(response).To(BeNil())
+		})
+
+		It("should return info as part of a verbose response", func() {
+			// Given
+			addContainerAndSandbox()
+			testContainer.SetStateAndSpoofPid(&oci.ContainerState{
+				State: specs.State{Status: oci.ContainerStateRunning},
+			})
+			testContainer.SetSpec(&specs.Spec{Version: "1.0.0"})
+
+			// When
+			response, err := sut.PodSandboxStatus(context.Background(),
+				&pb.PodSandboxStatusRequest{PodSandboxId: testSandbox.ID(), Verbose: true})
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(response).NotTo(BeNil())
+			Expect(response.Info).NotTo(BeNil())
+			Expect(response.Info["info"]).To(ContainSubstring(`"ociVersion":"1.0.0"`))
+			Expect(response.Info["info"]).To(ContainSubstring(`"image":"pauseImage"`))
 		})
 	})
 })

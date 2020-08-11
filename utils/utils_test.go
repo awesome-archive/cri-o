@@ -15,11 +15,11 @@ import (
 type errorReaderWriter struct {
 }
 
-func (m *errorReaderWriter) Write(p []byte) (n int, err error) {
+func (m *errorReaderWriter) Write(p []byte) (int, error) {
 	return 0, t.TestError
 }
 
-func (m *errorReaderWriter) Read(p []byte) (n int, err error) {
+func (m *errorReaderWriter) Read(p []byte) (int, error) {
 	return 0, t.TestError
 }
 
@@ -44,36 +44,6 @@ var _ = t.Describe("Utils", func() {
 			// Then
 			Expect(err).NotTo(BeNil())
 			Expect(res).To(BeEmpty())
-		})
-	})
-
-	t.Describe("ExecCmdWithStdStreams", func() {
-		It("should succeed", func() {
-			// Given
-			stdout := &bytes.Buffer{}
-			stderr := &bytes.Buffer{}
-
-			// When
-			err := utils.ExecCmdWithStdStreams(nil, stdout, stderr, "ls")
-
-			// Then
-			Expect(err).To(BeNil())
-			Expect(stdout.String()).NotTo(BeEmpty())
-			Expect(stderr.String()).To(BeEmpty())
-		})
-
-		It("should fail on wrong command", func() {
-			// Given
-			stdout := &bytes.Buffer{}
-			stderr := &bytes.Buffer{}
-
-			// When
-			err := utils.ExecCmdWithStdStreams(nil, stdout, stderr, "not-existing")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(stdout.String()).To(BeEmpty())
-			Expect(stderr.String()).To(BeEmpty())
 		})
 	})
 
@@ -517,11 +487,11 @@ nobody:x:65534:`
 
 	dir, err := ioutil.TempDir("/tmp", "uid-test")
 	Expect(err).To(BeNil())
-	err = os.Mkdir(filepath.Join(dir, "etc"), 0755)
+	err = os.Mkdir(filepath.Join(dir, "etc"), 0o755)
 	Expect(err).To(BeNil())
-	err = ioutil.WriteFile(filepath.Join(dir, "etc", "passwd"), []byte(alpinePasswdFile), 0755)
+	err = ioutil.WriteFile(filepath.Join(dir, "etc", "passwd"), []byte(alpinePasswdFile), 0o755)
 	Expect(err).To(BeNil())
-	err = ioutil.WriteFile(filepath.Join(dir, "etc", "group"), []byte(alpineGroupFile), 0755)
+	err = ioutil.WriteFile(filepath.Join(dir, "etc", "group"), []byte(alpineGroupFile), 0o755)
 	Expect(err).To(BeNil())
 	return dir
 }

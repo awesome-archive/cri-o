@@ -5,12 +5,13 @@ load helpers
 IMAGE=quay.io/crio/pause
 SIGNED_IMAGE=registry.access.redhat.com/rhel7-atomic:latest
 UNSIGNED_IMAGE=quay.io/crio/hello-world:latest
+
 IMAGE_LIST_TAG=docker.io/library/alpine:3.9
-IMAGE_LIST_DIGEST=docker.io/library/alpine@sha256:7746df395af22f04212cd25a92c1d6dbc5a06a0ca9579a229ef43008d4d1302a
-IMAGE_LIST_DIGEST_AMD64=docker.io/library/alpine@sha256:bf1684a6e3676389ec861c602e97f27b03f14178e5bc3f70dce198f9f160cce9
-IMAGE_LIST_DIGEST_ARM64=docker.io/library/alpine@sha256:1032bdba4c5f88facf7eceb259c18deb28a51785eb35e469285a03eba78dd3fc
-IMAGE_LIST_DIGEST_PPC64LE=docker.io/library/alpine@sha256:cb238aa5b34dfd5e57ddfb1bfbb564f01df218e6f6453e4036b302e32bca8bb5
-IMAGE_LIST_DIGEST_S390X=docker.io/library/alpine@sha256:d438d3b6a72b602b70bd259ebfb344e388d8809c5abf691f6de397de8c9e4572
+IMAGE_LIST_DIGEST_FOR_TAG=docker.io/library/alpine@sha256:414e0518bb9228d35e4cd5165567fb91d26c6a214e9c95899e1e056fcd349011
+IMAGE_LIST_DIGEST_FOR_TAG_AMD64=docker.io/library/alpine@sha256:65b3a80ebe7471beecbc090c5b2cdd0aafeaefa0715f8f12e40dc918a3a70e32
+
+IMAGE_LIST_DIGEST_AMD64=docker.io/library/alpine@sha256:ab3fe83c0696e3f565c9b4a734ec309ae9bd0d74c192de4590fd6dc2ef717815
+IMAGE_LIST_DIGEST=docker.io/library/alpine@sha256:ab3fe83c0696e3f565c9b4a734ec309ae9bd0d74c192de4590fd6dc2ef717815
 
 function setup() {
 	setup_test
@@ -51,7 +52,7 @@ function teardown() {
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
 
-	run crictl inspect "$ctr_id" --output yaml
+	run crictl inspect -o yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "image: quay.io/crio/redis:alpine" ]]
@@ -73,7 +74,7 @@ function teardown() {
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
 
-	run crictl inspect "$ctr_id" --output yaml
+	run crictl inspect -o yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "image: quay.io/crio/redis:alpine" ]]
@@ -99,7 +100,7 @@ function teardown() {
 	echo "$output"
 	[ "$status" -eq 0 ]
 
-	run crictl inspect "$ctr_id" --output yaml
+	run crictl inspect -o yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "image: quay.io/crio/redis:alpine" ]]
@@ -125,7 +126,7 @@ function teardown() {
 	echo "$output"
 	[ "$status" -eq 0 ]
 
-	run crictl inspect "$ctr_id" --output yaml
+	run crictl inspect -o yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "image: $IMAGE_LIST_DIGEST" ]]
@@ -133,7 +134,7 @@ function teardown() {
 }
 
 @test "image pull and list" {
-	start_crio "" ""
+	start_crio
 	run crictl pull "$IMAGE"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -157,7 +158,7 @@ function teardown() {
 
 @test "image pull with signature" {
 	skip "registry has some issues"
-	start_crio "" ""
+	start_crio
 	run crictl pull "$SIGNED_IMAGE"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -165,7 +166,7 @@ function teardown() {
 }
 
 @test "image pull and list by tag and ID" {
-	start_crio "" ""
+	start_crio
 	run crictl pull "$IMAGE:go"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -190,7 +191,7 @@ function teardown() {
 }
 
 @test "image pull and list by digest and ID" {
-	start_crio "" ""
+	start_crio
 	run crictl pull quay.io/crio/nginx@sha256:1ad874092a55efe2be0507a01d8a300e286f8137510854606ab1dd28861507a3
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -215,7 +216,7 @@ function teardown() {
 }
 
 @test "image pull and list by manifest list digest" {
-	start_crio "" ""
+	start_crio
 
 	run crictl pull ${IMAGE_LIST_DIGEST}
 	echo "$output"
@@ -241,27 +242,6 @@ function teardown() {
 		[ "$output" != "" ]
 		[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST_AMD64}" ]]
 		;;
-	arm64)
-		run crictl images -v ${IMAGE_LIST_DIGEST_ARM64}
-		[ "$status" -eq 0 ]
-		echo "$output"
-		[ "$output" != "" ]
-		[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST_ARM64}" ]]
-		;;
-	ppc64le)
-		run crictl images -v ${IMAGE_LIST_DIGEST_PPC64LE}
-		[ "$status" -eq 0 ]
-		echo "$output"
-		[ "$output" != "" ]
-		[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST_PPC64LE}" ]]
-		;;
-	s390x)
-		run crictl images -v ${IMAGE_LIST_DIGEST_S390X}
-		[ "$status" -eq 0 ]
-		echo "$output"
-		[ "$output" != "" ]
-		[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST_S390X}" ]]
-		;;
 	esac
 
 	run crictl images --quiet @"$imageid"
@@ -279,7 +259,7 @@ function teardown() {
 }
 
 @test "image pull and list by manifest list tag" {
-	start_crio "" ""
+	start_crio
 
 	run crictl pull ${IMAGE_LIST_TAG}
 	echo "$output"
@@ -289,21 +269,27 @@ function teardown() {
 	[ "$status" -eq 0 ]
 	echo "$output"
 	[ "$output" != "" ]
+
 	imageid="$output"
 
-	run crictl images -v ${IMAGE_LIST_DIGEST}
+	run crictl images -v ${IMAGE_LIST_DIGEST_FOR_TAG}
 	[ "$status" -eq 0 ]
 	echo "$output"
-	[ "$output" != "" ]
-	[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST}" ]]
+	if [ "$output" == "" ]; then
+		echo "NOTE: THIS TEST PROBABLY FAILED BECAUSE DIGEST HAS CHANGED, CONSIDER UPDATING TO MATCH THE FOLLOWING DIGEST:"
+		crictl inspecti ${IMAGE_LIST_TAG} | jq .status.repoDigests
+		echo "$output"
+		exit 1
+	fi
+	[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST_FOR_TAG}" ]]
 
 	case $(go env GOARCH) in
 	amd64)
-		run crictl images -v ${IMAGE_LIST_DIGEST_AMD64}
+		run crictl images -v ${IMAGE_LIST_DIGEST_FOR_TAG_AMD64}
 		[ "$status" -eq 0 ]
 		echo "$output"
 		[ "$output" != "" ]
-		[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST_AMD64}" ]]
+		[[ "$output" =~ "RepoDigests: ${IMAGE_LIST_DIGEST_FOR_TAG_AMD64}" ]]
 		;;
 	arm64)
 		run crictl images -v ${IMAGE_LIST_DIGEST_ARM64}
@@ -343,7 +329,7 @@ function teardown() {
 }
 
 @test "image pull and list by manifest list and individual digest" {
-	start_crio "" ""
+	start_crio
 
 	run crictl pull ${IMAGE_LIST_DIGEST}
 	echo "$output"
@@ -411,7 +397,7 @@ function teardown() {
 }
 
 @test "image pull and list by individual and manifest list digest" {
-	start_crio "" ""
+	start_crio
 
 	case $(go env GOARCH) in
 	amd64)
@@ -479,7 +465,7 @@ function teardown() {
 }
 
 @test "image list with filter" {
-	start_crio "" ""
+	start_crio
 	run crictl pull "$IMAGE"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -502,7 +488,7 @@ function teardown() {
 }
 
 @test "image list/remove" {
-	start_crio "" ""
+	start_crio
 	run crictl pull "$IMAGE"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -527,7 +513,7 @@ function teardown() {
 }
 
 @test "image status/remove" {
-	start_crio "" ""
+	start_crio
 	run crictl pull "$IMAGE"
 	echo "$output"
 	[ "$status" -eq 0 ]

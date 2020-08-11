@@ -2,20 +2,14 @@ package server_test
 
 import (
 	"context"
-	"io/ioutil"
-	"os"
-	"path/filepath"
 
-	"github.com/containers/libpod/pkg/annotations"
-	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/cri-o/server"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/opencontainers/runtime-tools/generate"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
@@ -34,11 +28,16 @@ var _ = t.Describe("RunPodSandbox", func() {
 		// cyclomatic complexity and test it separately
 		It("should fail when container creation errors", func() {
 			// Given
+			// when we ManageNSLifecycle, we do networking setup before we do container creation
+			// mocking the networking setup blows up complexity of this test, which is really
+			// not testing the behavior of managing ns lifecycle. Override default for this test
+			sut.SetManageNSLifecycle(false)
 			gomock.InOrder(
 				runtimeServerMock.EXPECT().CreatePodSandbox(gomock.Any(),
 					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
-					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+					gomock.Any()).
 					Return(storage.ContainerInfo{
 						RunDir: "/tmp",
 						Config: &v1.Image{Config: v1.ImageConfig{}},
@@ -49,6 +48,8 @@ var _ = t.Describe("RunPodSandbox", func() {
 					gomock.Any()).Return(nil),
 				runtimeServerMock.EXPECT().StartContainer(gomock.Any()).
 					Return("", nil),
+				runtimeServerMock.EXPECT().StopContainer(gomock.Any()).
+					Return(nil),
 				runtimeServerMock.EXPECT().RemovePodSandbox(gomock.Any()).
 					Return(nil),
 			)
@@ -59,13 +60,17 @@ var _ = t.Describe("RunPodSandbox", func() {
 					Metadata: &pb.PodSandboxMetadata{
 						Name:      "name",
 						Namespace: "default",
+						Uid:       "uid",
 					},
 					LogDirectory: "/tmp",
 					Linux: &pb.LinuxPodSandboxConfig{
 						SecurityContext: &pb.LinuxSandboxSecurityContext{
 							NamespaceOptions: &pb.NamespaceOption{
 								Ipc: pb.NamespaceMode_NODE,
-							}}}}})
+							},
+						},
+					},
+				}})
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -117,7 +122,8 @@ var _ = t.Describe("RunPodSandbox", func() {
 				runtimeServerMock.EXPECT().CreatePodSandbox(gomock.Any(),
 					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
-					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+					gomock.Any()).
 					Return(storage.ContainerInfo{}, nil),
 				runtimeServerMock.EXPECT().RemovePodSandbox(gomock.Any()).
 					Return(nil),
@@ -129,163 +135,13 @@ var _ = t.Describe("RunPodSandbox", func() {
 					Metadata: &pb.PodSandboxMetadata{
 						Name:      "name",
 						Namespace: "default",
+						Uid:       "uid",
 					},
 				}})
 
 			// Then
 			Expect(err).NotTo(BeNil())
 			Expect(response).To(BeNil())
-		})
-	})
-
-	t.Describe("AddCgroupAnnotation", func() {
-		var g generate.Generator
-
-		BeforeEach(func() {
-			// Given
-			var err error
-			g, err = generate.New("linux")
-			Expect(err).To(BeNil())
-		})
-
-		It("should succeed with empty parent cgroup and manager", func() {
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g, "",
-				"", "", "id")
-
-			// Then
-			Expect(err).To(BeNil())
-			Expect(res).To(Equal(""))
-			Expect(g.Config.Annotations[annotations.CgroupParent]).To(BeEmpty())
-		})
-
-		It("should succeed with non-systemd manager", func() {
-			// Given
-			const cgroup = "someCgroup"
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g, "",
-				"manager", cgroup, "id")
-
-			// Then
-			Expect(err).To(BeNil())
-			Expect(res).To(Equal(cgroup))
-			Expect(g.Config.Annotations[annotations.CgroupParent]).To(Equal(cgroup))
-			Expect(g.Config.Linux.CgroupsPath).To(HavePrefix(cgroup))
-		})
-
-		It("should succed with systemd manager", func() {
-			// Given
-			const cgroup = "some.slice"
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g, "",
-				oci.SystemdCgroupsManager, cgroup, "id")
-
-			// Then
-			Expect(err).To(BeNil())
-			Expect(res).To(Equal(cgroup))
-		})
-
-		It("should fail with non-systemd manager but systemd slice", func() {
-			// Given
-			const cgroup = "some.slice"
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g, "",
-				"manager", cgroup, "id")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(res).To(Equal(""))
-		})
-
-		It("should fail with systemd manager on invalid slice", func() {
-			// Given
-			const cgroup = "someCgroup"
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g, "",
-				oci.SystemdCgroupsManager, cgroup, "id")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(res).To(Equal(""))
-		})
-
-		It("should fail with systemd manager if ExpandSlice fails", func() {
-			// Given
-			const cgroup = "some--wrong.slice"
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g, "",
-				oci.SystemdCgroupsManager, cgroup, "id")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(res).To(Equal(""))
-		})
-
-		var prepareCgroupDirs = func(content string) (string, string) {
-			const cgroup = "some.slice"
-			tmpDir := t.MustTempDir("cgroup")
-			Expect(os.MkdirAll(filepath.Join(tmpDir, cgroup), 0755)).To(BeNil())
-			Expect(ioutil.WriteFile(
-				filepath.Join(tmpDir, cgroup, "memory.limit_in_bytes"),
-				[]byte(content), 0644)).To(BeNil())
-			return cgroup, tmpDir
-		}
-
-		It("should succeed with systemd manager if memory string empty", func() {
-			// Given
-			cgroup, tmpDir := prepareCgroupDirs("")
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g,
-				tmpDir, oci.SystemdCgroupsManager, cgroup, "id")
-
-			// Then
-			Expect(err).To(BeNil())
-			Expect(res).To(Equal(cgroup))
-		})
-
-		It("should succeed with systemd manager with valid memory ", func() {
-			// Given
-			cgroup, tmpDir := prepareCgroupDirs("13000000")
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g,
-				tmpDir, oci.SystemdCgroupsManager, cgroup, "id")
-
-			// Then
-			Expect(err).To(BeNil())
-			Expect(res).To(Equal(cgroup))
-		})
-
-		It("should fail with systemd manager with too low memory", func() {
-			// Given
-			cgroup, tmpDir := prepareCgroupDirs("10")
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g,
-				tmpDir, oci.SystemdCgroupsManager, cgroup, "id")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(res).To(Equal(""))
-		})
-
-		It("should fail with systemd manager with invalid memory ", func() {
-			// Given
-			cgroup, tmpDir := prepareCgroupDirs("invalid")
-
-			// When
-			res, err := server.AddCgroupAnnotation(context.Background(), g,
-				tmpDir, oci.SystemdCgroupsManager, cgroup, "id")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(res).To(Equal(""))
 		})
 	})
 

@@ -1,21 +1,21 @@
 package lib
 
 import (
-	"encoding/json"
 	"path/filepath"
 
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
 	"github.com/containers/libpod/pkg/annotations"
+	"github.com/containers/storage/pkg/ioutils"
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/docker/docker/pkg/ioutils"
+	json "github.com/json-iterator/go"
 	"github.com/opencontainers/runtime-tools/generate"
 )
 
 const configFile = "config.json"
 
 // ContainerRename renames the given container
-func (c *ContainerServer) ContainerRename(container, name string) error {
+func (c *ContainerServer) ContainerRename(container, name string) (retErr error) {
 	ctr, err := c.LookupContainer(container)
 	if err != nil {
 		return err
@@ -27,7 +27,7 @@ func (c *ContainerServer) ContainerRename(container, name string) error {
 		return err
 	}
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			c.ReleaseContainerName(name)
 		} else {
 			c.ReleaseContainerName(oldName)
@@ -70,7 +70,7 @@ func (c *ContainerServer) updateStateName(ctr *oci.Container, name string) error
 		ctr.State().Annotations[annotations.Metadata] = updateMetadata(ctr.State().Annotations, name)
 	}
 	// This is taken directly from c.ContainerStateToDisk(), which can't be used because of the call to UpdateStatus() in the first line
-	jsonSource, err := ioutils.NewAtomicFileWriter(ctr.StatePath(), 0644)
+	jsonSource, err := ioutils.NewAtomicFileWriter(ctr.StatePath(), 0o644)
 	if err != nil {
 		return err
 	}

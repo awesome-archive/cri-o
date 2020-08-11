@@ -23,7 +23,8 @@ var _ = t.Describe("PodSandboxStatus", func() {
 		It("should succeed with already stopped sandbox", func() {
 			// Given
 			addContainerAndSandbox()
-			testSandbox.SetStopped()
+			testSandbox.SetStopped(false)
+			Expect(testSandbox.SetNetworkStopped(false)).To(BeNil())
 
 			// When
 			response, err := sut.StopPodSandbox(context.Background(),
@@ -50,7 +51,7 @@ var _ = t.Describe("PodSandboxStatus", func() {
 			addContainerAndSandbox()
 			gomock.InOrder(
 				cniPluginMock.EXPECT().GetDefaultNetworkName().Return(""),
-				cniPluginMock.EXPECT().TearDownPod(gomock.Any()).Return(t.TestError),
+				cniPluginMock.EXPECT().TearDownPodWithContext(gomock.Any(), gomock.Any()).Return(t.TestError),
 			)
 
 			// When

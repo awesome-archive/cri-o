@@ -1,11 +1,14 @@
 package server
 
 import (
-	"strconv"
-
-	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/log"
+	"github.com/cri-o/cri-o/internal/log"
+	oci "github.com/cri-o/cri-o/internal/oci"
+	json "github.com/json-iterator/go"
+	spec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
@@ -16,14 +19,14 @@ const (
 )
 
 // ContainerStatus returns status of the container.
-func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusRequest) (resp *pb.ContainerStatusResponse, err error) {
+func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusRequest) (*pb.ContainerStatusResponse, error) {
 	c, err := s.GetContainerFromShortID(req.ContainerId)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.NotFound, "could not find container %q: %v", req.ContainerId, err)
 	}
 
 	containerID := c.ID()
-	resp = &pb.ContainerStatusResponse{
+	resp := &pb.ContainerStatusResponse{
 		Status: &pb.ContainerStatus{
 			Id:          containerID,
 			Metadata:    c.Metadata(),
@@ -46,12 +49,12 @@ func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusReq
 	}
 	resp.Status.Mounts = mounts
 
-	cState := c.State()
+	cState := c.StateNoLock()
 	rStatus := pb.ContainerState_CONTAINER_UNKNOWN
 
-	// If we defaulted to exit code -1 earlier then we attempt to
+	// If we defaulted to exit code not set earlier then we attempt to
 	// get the exit code from the exit file again.
-	if cState.ExitCode == -1 {
+	if cState.Status == oci.ContainerStateStopped && cState.ExitCode == nil {
 		err := s.Runtime().UpdateContainerStatus(c)
 		if err != nil {
 			log.Warnf(ctx, "Failed to UpdateStatus of container %s: %v", c.ID(), err)
@@ -76,11 +79,15 @@ func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusReq
 		resp.Status.StartedAt = started
 		finished := cState.Finished.UnixNano()
 		resp.Status.FinishedAt = finished
-		resp.Status.ExitCode = cState.ExitCode
+		if cState.ExitCode == nil {
+			resp.Status.ExitCode = -1
+		} else {
+			resp.Status.ExitCode = *cState.ExitCode
+		}
 		switch {
 		case cState.OOMKilled:
 			resp.Status.Reason = oomKilledReason
-		case cState.ExitCode == 0:
+		case resp.Status.ExitCode == 0:
 			resp.Status.Reason = completedReason
 		default:
 			resp.Status.Reason = errorReason
@@ -92,11 +99,36 @@ func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusReq
 	resp.Status.LogPath = c.LogPath()
 
 	if req.Verbose {
-		resp.Info = map[string]string{
-			"pid":       strconv.Itoa(c.State().Pid),
-			"sandboxId": c.Sandbox(),
+		info, err := s.createContainerInfo(c)
+		if err != nil {
+			return nil, errors.Wrap(err, "creating container info")
 		}
+		resp.Info = info
 	}
 
 	return resp, nil
+}
+
+func (s *Server) createContainerInfo(container *oci.Container) (map[string]string, error) {
+	metadata, err := s.StorageRuntimeServer().GetContainerMetadata(container.ID())
+	if err != nil {
+		return nil, errors.Wrap(err, "getting container metadata")
+	}
+
+	info := struct {
+		SandboxID   string    `json:"sandboxID"`
+		Pid         int       `json:"pid"`
+		RuntimeSpec spec.Spec `json:"runtimeSpec"`
+		Privileged  bool      `json:"privileged"`
+	}{
+		container.Sandbox(),
+		container.State().Pid,
+		container.Spec(),
+		metadata.Privileged,
+	}
+	bytes, err := json.Marshal(info)
+	if err != nil {
+		return nil, errors.Wrapf(err, "marshal data: %v", info)
+	}
+	return map[string]string{"info": string(bytes)}, nil
 }

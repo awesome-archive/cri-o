@@ -2,12 +2,8 @@ package server_test
 
 import (
 	"context"
-	"io/ioutil"
-	"os"
 
-	"github.com/containers/image/v5/types"
 	cstorage "github.com/containers/storage"
-	"github.com/cri-o/cri-o/internal/pkg/signals"
 	"github.com/cri-o/cri-o/server"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
@@ -28,19 +24,13 @@ var _ = t.Describe("Server", func() {
 		invalid    = "invalid"
 	)
 
-	getTmpFile := func() string {
-		tmpfile, err := ioutil.TempFile(os.TempDir(), "config")
-		Expect(err).To(BeNil())
-		return tmpfile.Name()
-	}
-
 	t.Describe("New", func() {
 		It("should succeed", func() {
 			// Given
 			mockNewServer()
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).To(BeNil())
@@ -51,13 +41,9 @@ var _ = t.Describe("Server", func() {
 		It("should succeed with valid config path", func() {
 			// Given
 			mockNewServer()
-			tmpFile := getTmpFile()
-			defer os.RemoveAll(tmpFile)
 
 			// When
-			server, err := server.New(
-				context.Background(), nil, tmpFile, libMock,
-			)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).To(BeNil())
@@ -72,7 +58,7 @@ var _ = t.Describe("Server", func() {
 			serverConfig.GIDMappings = "1:1:1"
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).To(BeNil())
@@ -87,7 +73,7 @@ var _ = t.Describe("Server", func() {
 			serverConfig.StreamTLSCert = "../test/testdata/cert.pem"
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).To(BeNil())
@@ -108,9 +94,9 @@ var _ = t.Describe("Server", func() {
 						{},
 					}, testError),
 				storeMock.EXPECT().Metadata(gomock.Any()).
-					Return(`{"Pod": false}`, nil),
+					Return(`{"Pod": false, "pod-name": "name", "pod-id": "id" }`, nil),
 				storeMock.EXPECT().Metadata(gomock.Any()).
-					Return(`{"Pod": true}`, nil),
+					Return(`{"Pod": true, "pod-name": "name", "pod-id": "id" }`, nil),
 				storeMock.EXPECT().Metadata(gomock.Any()).
 					Return("", t.TestError),
 				storeMock.EXPECT().
@@ -122,7 +108,7 @@ var _ = t.Describe("Server", func() {
 			)
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).To(BeNil())
@@ -132,14 +118,14 @@ var _ = t.Describe("Server", func() {
 		It("should fail when provided config is nil", func() {
 			// Given
 			// When
-			server, err := server.New(context.Background(), nil, "", nil)
+			server, err := server.New(context.Background(), nil)
 
 			// Then
 			Expect(err).NotTo(BeNil())
 			Expect(server).To(BeNil())
 		})
 
-		It("should fail when socket dir creation erros", func() {
+		It("should fail when socket dir creation errors", func() {
 			// Given
 			gomock.InOrder(
 				libMock.EXPECT().GetData().Times(2).Return(serverConfig),
@@ -147,14 +133,14 @@ var _ = t.Describe("Server", func() {
 			serverConfig.ContainerAttachSocketDir = invalidDir
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).NotTo(BeNil())
 			Expect(server).To(BeNil())
 		})
 
-		It("should fail when container exits dir creation erros", func() {
+		It("should fail when container exits dir creation errors", func() {
 			// Given
 			gomock.InOrder(
 				libMock.EXPECT().GetData().Times(2).Return(serverConfig),
@@ -162,24 +148,7 @@ var _ = t.Describe("Server", func() {
 			serverConfig.ContainerExitsDir = invalidDir
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(server).To(BeNil())
-		})
-
-		It("should fail when CNI init errors", func() {
-			// Given
-			gomock.InOrder(
-				libMock.EXPECT().GetData().Times(2).Return(serverConfig),
-				libMock.EXPECT().GetStore().Return(storeMock, nil),
-				libMock.EXPECT().GetData().Return(serverConfig),
-			)
-			serverConfig.NetworkDir = invalidDir
-
-			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -198,7 +167,7 @@ var _ = t.Describe("Server", func() {
 			serverConfig.GIDMappings = g
 
 			// When
-			sut, err := server.New(context.Background(), nil, "", libMock)
+			sut, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -209,40 +178,6 @@ var _ = t.Describe("Server", func() {
 			Entry("sz", "1:1:w", "1:1:w"),
 		)
 
-		It("should fail with inavailable seccomp profile", func() {
-			// Given
-			gomock.InOrder(
-				libMock.EXPECT().GetData().Times(2).Return(serverConfig),
-				libMock.EXPECT().GetStore().Return(storeMock, nil),
-				libMock.EXPECT().GetData().Return(serverConfig),
-			)
-			serverConfig.SeccompProfile = invalidDir
-
-			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(server).To(BeNil())
-		})
-
-		It("should fail with wrong seccomp profile", func() {
-			// Given
-			gomock.InOrder(
-				libMock.EXPECT().GetData().Times(2).Return(serverConfig),
-				libMock.EXPECT().GetStore().Return(storeMock, nil),
-				libMock.EXPECT().GetData().Return(serverConfig),
-			)
-			serverConfig.SeccompProfile = "/dev/null"
-
-			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(server).To(BeNil())
-		})
-
 		It("should fail with invalid stream address and port", func() {
 			// Given
 			mockNewServer()
@@ -250,7 +185,7 @@ var _ = t.Describe("Server", func() {
 			serverConfig.StreamPort = invalid
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -265,7 +200,7 @@ var _ = t.Describe("Server", func() {
 			serverConfig.StreamTLSKey = invalid
 
 			// When
-			server, err := server.New(context.Background(), nil, "", libMock)
+			server, err := server.New(context.Background(), libMock)
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -337,109 +272,6 @@ var _ = t.Describe("Server", func() {
 
 			// Then
 			Expect(err).To(BeNil())
-		})
-	})
-
-	t.Describe("StartConfigWatcher", func() {
-		// Prepare the sut
-		BeforeEach(setupSUT)
-
-		It("should succeed", func() {
-			// Given
-			tmpFile := getTmpFile()
-			defer os.RemoveAll(tmpFile)
-
-			// When
-			ch, err := sut.StartConfigWatcher(
-				tmpFile, func(fileName string) error {
-					return nil
-				},
-			)
-			ch <- signals.Hup
-
-			// Then
-			Expect(err).To(BeNil())
-		})
-
-		It("should succeed with failing reload closure", func() {
-			// Given
-			tmpFile := getTmpFile()
-			defer os.RemoveAll(tmpFile)
-
-			// When
-			ch, err := sut.StartConfigWatcher(
-				tmpFile, func(fileName string) error {
-					return t.TestError
-				},
-			)
-			ch <- signals.Hup
-
-			// Then
-			Expect(err).To(BeNil())
-		})
-
-		It("should fail when fileName does not exist", func() {
-			// Given
-			// When
-			_, err := sut.StartConfigWatcher("", nil)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
-
-		It("should fail when reload closure is nil", func() {
-			// Given
-			tmpFile := getTmpFile()
-			defer os.RemoveAll(tmpFile)
-
-			// When
-			_, err := sut.StartConfigWatcher(tmpFile, nil)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
-	})
-
-	t.Describe("ReloadRegistries", func() {
-		// The test registries file
-		regConf := ""
-
-		// Prepare the sut
-		BeforeEach(func() {
-			regConf = t.MustTempFile("reload-registries")
-			ctx := &types.SystemContext{SystemRegistriesConfPath: regConf}
-			setupSUTWithContext(ctx)
-		})
-
-		It("should succeed to reload registries", func() {
-			// Given
-			// When
-			err := sut.ReloadRegistries(regConf)
-
-			// Then
-			Expect(err).To(BeNil())
-		})
-
-		It("should fail if registries file got deleted", func() {
-			// Given
-			Expect(os.Remove(regConf)).To(BeNil())
-
-			// When
-			err := sut.ReloadRegistries(regConf)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
-
-		It("should fail if registries file is invalid", func() {
-			// Given
-			Expect(ioutil.WriteFile(regConf, []byte("invalid"), 0755)).To(BeNil())
-
-			// When
-			err := sut.ReloadRegistries(regConf)
-
-			// Then
-			Expect(err).NotTo(BeNil())
 		})
 	})
 })

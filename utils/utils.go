@@ -16,10 +16,11 @@ import (
 	"syscall"
 
 	"github.com/containers/libpod/pkg/lookup"
-	"github.com/docker/docker/pkg/symlink"
+	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/opencontainers/runc/libcontainer/user"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
@@ -43,24 +44,6 @@ func ExecCmd(name string, args ...string) (string, error) {
 	}
 
 	return stdout.String(), nil
-}
-
-// ExecCmdWithStdStreams execute a command with the specified standard streams.
-func ExecCmdWithStdStreams(stdin io.Reader, stdout, stderr io.Writer, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", v))
-	}
-
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("`%v %v` failed: %v", name, strings.Join(args, " "), err)
-	}
-
-	return nil
 }
 
 // StatusToExitCode converts wait status code to an exit code
@@ -110,7 +93,11 @@ func (DetachError) Error() string {
 }
 
 // CopyDetachable is similar to io.Copy but support a detach key sequence to break out.
-func CopyDetachable(dst io.Writer, src io.Reader, keys []byte) (written int64, err error) {
+func CopyDetachable(dst io.Writer, src io.Reader, keys []byte) (int64, error) {
+	var (
+		written int64
+		err     error
+	)
 	// Sanity check interfaces
 	if dst == nil || src == nil {
 		return 0, fmt.Errorf("src/dst reader/writer nil")
@@ -186,7 +173,7 @@ func WriteGoroutineStacks(w io.Writer) error {
 // WriteGoroutineStacksToFile write goroutine stacks
 // to the specified file.
 func WriteGoroutineStacksToFile(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0666)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o666)
 	if err != nil {
 		return err
 	}
@@ -203,14 +190,14 @@ func WriteGoroutineStacksToFile(path string) error {
 func GenerateID() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return "", errors.Wrapf(err, "generate ID")
+		return "", errors.Wrap(err, "generate ID")
 	}
 	return hex.EncodeToString(b), nil
 }
 
 // openContainerFile opens a file inside a container rootfs safely
 func openContainerFile(rootfs, path string) (io.ReadCloser, error) {
-	fp, err := symlink.FollowSymlinkInScope(filepath.Join(rootfs, path), rootfs)
+	fp, err := securejoin.SecureJoin(rootfs, path)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +206,7 @@ func openContainerFile(rootfs, path string) (io.ReadCloser, error) {
 
 // GetUserInfo returns UID, GID and additional groups for specified user
 // by looking them up in /etc/passwd and /etc/group
-func GetUserInfo(rootfs, userName string) (uid, gid uint32, additionalGids []uint32, err error) {
+func GetUserInfo(rootfs, userName string) (uid, gid uint32, additionalGids []uint32, _ error) {
 	// We don't care if we can't open the file because
 	// not all images will have these files
 	passwdFile, err := openContainerFile(rootfs, "/etc/passwd")
@@ -260,9 +247,9 @@ func GeneratePasswd(username string, uid, gid uint32, homedir, rootfs, rundir st
 		return "", nil
 	}
 	passwdFile := filepath.Join(rundir, "passwd")
-	originPasswdFile, err := symlink.FollowSymlinkInScope(filepath.Join(rootfs, "/etc/passwd"), rootfs)
+	originPasswdFile, err := securejoin.SecureJoin(rootfs, "/etc/passwd")
 	if err != nil {
-		return "", errors.Wrapf(err, "unable to follow symlinks to passwd file")
+		return "", errors.Wrap(err, "unable to follow symlinks to passwd file")
 	}
 	info, err := os.Stat(originPasswdFile)
 	if err != nil {
@@ -272,13 +259,13 @@ func GeneratePasswd(username string, uid, gid uint32, homedir, rootfs, rundir st
 		return "", errors.Wrapf(err, "unable to stat passwd file %s", originPasswdFile)
 	}
 	// Check if passwd file is world writable
-	if info.Mode().Perm()&(0022) != 0 {
+	if info.Mode().Perm()&(0o022) != 0 {
 		return "", nil
 	}
 	passwdUID := info.Sys().(*syscall.Stat_t).Uid
 	passwdGID := info.Sys().(*syscall.Stat_t).Gid
 
-	if uid == passwdUID && info.Mode().Perm()&(0200) != 0 {
+	if uid == passwdUID && info.Mode().Perm()&(0o200) != 0 {
 		return "", nil
 	}
 
@@ -298,11 +285,58 @@ func GeneratePasswd(username string, uid, gid uint32, homedir, rootfs, rundir st
 	}
 	pwd := fmt.Sprintf("%s%s:x:%d:%d:%s user:%s:/sbin/nologin\n", orig, username, uid, gid, username, homedir)
 	if err := ioutil.WriteFile(passwdFile, []byte(pwd), info.Mode()); err != nil {
-		return "", errors.Wrapf(err, "failed to create temporary passwd file")
+		return "", errors.Wrap(err, "failed to create temporary passwd file")
 	}
 	if err := os.Chown(passwdFile, int(passwdUID), int(passwdGID)); err != nil {
-		return "", errors.Wrapf(err, "failed to chown temporary passwd file")
+		return "", errors.Wrap(err, "failed to chown temporary passwd file")
 	}
 
 	return passwdFile, nil
+}
+
+// Int32Ptr is a utility function to assign to integer pointer variables
+func Int32Ptr(i int32) *int32 {
+	return &i
+}
+
+// EnsureSaneLogPath is a hack to fix https://issues.k8s.io/44043 which causes
+// logPath to be a broken symlink to some magical Docker path. Ideally we
+// wouldn't have to deal with this, but until that issue is fixed we have to
+// remove the path if it's a broken symlink.
+func EnsureSaneLogPath(logPath string) error {
+	// If the path exists but the resolved path does not, then we have a broken
+	// symlink and we need to remove it.
+	fi, err := os.Lstat(logPath)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		// Non-existent files and non-symlinks aren't our problem.
+		return nil
+	}
+
+	_, err = os.Stat(logPath)
+	if os.IsNotExist(err) {
+		err = os.RemoveAll(logPath)
+		if err != nil {
+			return fmt.Errorf("failed to remove bad log path %s: %v", logPath, err)
+		}
+	}
+	return nil
+}
+
+func GetLabelOptions(selinuxOptions *pb.SELinuxOption) []string {
+	labels := []string{}
+	if selinuxOptions != nil {
+		if selinuxOptions.User != "" {
+			labels = append(labels, "user:"+selinuxOptions.User)
+		}
+		if selinuxOptions.Role != "" {
+			labels = append(labels, "role:"+selinuxOptions.Role)
+		}
+		if selinuxOptions.Type != "" {
+			labels = append(labels, "type:"+selinuxOptions.Type)
+		}
+		if selinuxOptions.Level != "" {
+			labels = append(labels, "level:"+selinuxOptions.Level)
+		}
+	}
+	return labels
 }

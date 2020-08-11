@@ -6,7 +6,6 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,12 +13,11 @@ import (
 	encconfig "github.com/containers/ocicrypt/config"
 	cryptUtils "github.com/containers/ocicrypt/utils"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
-	libconfig "github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/ocicni/pkg/ocicni"
-	units "github.com/docker/go-units"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-tools/validate"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/syndtr/gocapability/capability"
 	"k8s.io/apimachinery/pkg/api/resource"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
@@ -139,11 +137,11 @@ func (s *Server) newPodNetwork(sb *sandbox.Sandbox) (ocicni.PodNetwork, error) {
 		}
 	}
 
-	network := s.netPlugin.GetDefaultNetworkName()
+	network := s.config.CNIPlugin().GetDefaultNetworkName()
 	return ocicni.PodNetwork{
 		Name:      sb.KubeName(),
 		Namespace: sb.Namespace(),
-		Networks:  make([]string, 0),
+		Networks:  []ocicni.NetAttachment{},
 		ID:        sb.ID(),
 		NetNS:     sb.NetNsPath(),
 		RuntimeConfig: map[string]ocicni.RuntimeConfig{
@@ -228,111 +226,19 @@ func mergeEnvs(imageConfig *v1.Image, kubeEnvs []*pb.KeyValue) []string {
 	return envs
 }
 
-// Namespace represents a kernel namespace name.
-type Namespace string
-
-const (
-	// IpcNamespace is the Linux IPC namespace
-	IpcNamespace = Namespace("ipc")
-
-	// NetNamespace is the network namespace
-	NetNamespace = Namespace("net")
-
-	// UnknownNamespace is the zero value if no namespace is known
-	UnknownNamespace = Namespace("")
-)
-
-var namespaces = map[string]Namespace{
-	"kernel.sem": IpcNamespace,
-}
-
-var prefixNamespaces = map[string]Namespace{
-	"kernel.shm": IpcNamespace,
-	"kernel.msg": IpcNamespace,
-	"fs.mqueue.": IpcNamespace,
-	"net.":       NetNamespace,
-}
-
-// validateSysctl checks that a sysctl is whitelisted because it is known
-// to be namespaced by the Linux kernel.
-// The parameters hostNet and hostIPC are used to forbid sysctls for pod sharing the
-// respective namespaces with the host. This check is only used on sysctls defined by
-// the user in the crio.conf file.
-func validateSysctl(sysctl string, hostNet, hostIPC bool) error {
-	nsErrorFmt := "%q not allowed with host %s enabled"
-	if ns, found := namespaces[sysctl]; found {
-		if ns == IpcNamespace && hostIPC {
-			return errors.Errorf(nsErrorFmt, sysctl, ns)
-		}
-		if ns == NetNamespace && hostNet {
-			return errors.Errorf(nsErrorFmt, sysctl, ns)
-		}
-		return nil
-	}
-	for p, ns := range prefixNamespaces {
-		if strings.HasPrefix(sysctl, p) {
-			if ns == IpcNamespace && hostIPC {
-				return errors.Errorf(nsErrorFmt, sysctl, ns)
-			}
-			if ns == NetNamespace && hostNet {
-				return errors.Errorf(nsErrorFmt, sysctl, ns)
-			}
-			return nil
-		}
-	}
-	return errors.Errorf("%q not whitelisted", sysctl)
-}
-
-type ulimit struct {
-	name string
-	hard uint64
-	soft uint64
-}
-
-func getUlimitsFromConfig(config *libconfig.Config) ([]ulimit, error) {
-	ulimits := make([]ulimit, 0, len(config.RuntimeConfig.DefaultUlimits))
-	for _, u := range config.RuntimeConfig.DefaultUlimits {
-		ul, err := units.ParseUlimit(u)
-		if err != nil {
-			return nil, err
-		}
-		rl, err := ul.GetRlimit()
-		if err != nil {
-			return nil, err
-		}
-		// This sucks, but it's the runtime-tools interface
-		ulimits = append(ulimits, ulimit{name: "RLIMIT_" + strings.ToUpper(ul.Name), hard: rl.Hard, soft: rl.Soft})
-	}
-	return ulimits, nil
-}
-
 // Translate container labels to a description of the container
 func translateLabelsToDescription(labels map[string]string) string {
 	return fmt.Sprintf("%s/%s/%s", labels[types.KubernetesPodNamespaceLabel], labels[types.KubernetesPodNameLabel], labels[types.KubernetesContainerNameLabel])
 }
 
-// Validate given hostIP IP belongs to the current host
-// adapted from github.com/kubernetes/kubernetes/pkg/kubelet/kubelet_node_status.go
-func validateHostIP(hostIP net.IP) error {
-	if hostIP.IsLoopback() {
-		return fmt.Errorf("hostIP can't be loopback address")
-	}
-	if hostIP.IsMulticast() {
-		return fmt.Errorf("hostIP can't be a multicast address")
-	}
-	if hostIP.IsLinkLocalUnicast() {
-		return fmt.Errorf("hostIP can't be a link-local unicast address")
-	}
-	if hostIP.IsUnspecified() {
-		return fmt.Errorf("hostIP can't be an all zeros address")
-	}
-	return nil
-}
-
 // getDecryptionKeys reads the keys from the given directory
-func getDecryptionKeys(keysPath string) (encconfig.CryptoConfig, error) {
-	base64Keys := make([]string, 0)
+func getDecryptionKeys(keysPath string) (*encconfig.DecryptConfig, error) {
+	if _, err := os.Stat(keysPath); os.IsNotExist(err) {
+		logrus.Debugf("skipping non-existing decryption_keys_path: %s", keysPath)
+		return &encconfig.DecryptConfig{}, nil
+	}
 
+	base64Keys := []string{}
 	walkFn := func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -358,15 +264,14 @@ func getDecryptionKeys(keysPath string) (encconfig.CryptoConfig, error) {
 		return nil
 	}
 
-	err := filepath.Walk(keysPath, walkFn)
-	if err != nil {
-		return encconfig.CryptoConfig{}, err
+	if err := filepath.Walk(keysPath, walkFn); err != nil {
+		return nil, err
 	}
 
 	sortedDc, err := cryptUtils.SortDecryptionKeys(strings.Join(base64Keys, ","))
 	if err != nil {
-		return encconfig.CryptoConfig{}, err
+		return nil, err
 	}
 
-	return encconfig.InitDecryption(sortedDc), nil
+	return encconfig.InitDecryption(sortedDc).DecryptConfig, nil
 }

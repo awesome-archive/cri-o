@@ -26,19 +26,9 @@ const (
 	// ContainerCreateTimeout represents the value of container creating timeout
 	ContainerCreateTimeout = 240 * time.Second
 
-	// CgroupfsCgroupsManager represents cgroupfs native cgroup manager
-	CgroupfsCgroupsManager = "cgroupfs"
-	// SystemdCgroupsManager represents systemd native cgroup manager
-	SystemdCgroupsManager = "systemd"
-
 	// killContainerTimeout is the timeout that we wait for the container to
 	// be SIGKILLed.
 	killContainerTimeout = 2 * time.Minute
-
-	// minCtrStopTimeout is the minimal amount of time in seconds to wait
-	// before issuing a timeout regarding the proper termination of the
-	// container.
-	minCtrStopTimeout = 30
 )
 
 // Runtime is the generic structure holding both global and specific
@@ -68,11 +58,12 @@ type RuntimeImpl interface {
 	UpdateContainerStatus(*Container) error
 	PauseContainer(*Container) error
 	UnpauseContainer(*Container) error
-	ContainerStats(*Container) (*ContainerStats, error)
+	ContainerStats(*Container, string) (*ContainerStats, error)
 	SignalContainer(*Container, syscall.Signal) error
 	AttachContainer(*Container, io.Reader, io.WriteCloser, io.WriteCloser,
 		bool, <-chan remotecommand.TerminalSize) error
-	PortForwardContainer(*Container, int32, io.ReadWriter) error
+	PortForwardContainer(context.Context, *Container, string,
+		int32, io.ReadWriteCloser) error
 	ReopenContainerLog(*Container) error
 	WaitContainerStateStopped(context.Context, *Container) error
 }
@@ -112,7 +103,7 @@ func (r *Runtime) ValidateRuntimeHandler(handler string) (*config.RuntimeHandler
 // WaitContainerStateStopped runs a loop polling UpdateStatus(), seeking for
 // the container status to be updated to 'stopped'. Either it gets the expected
 // status and returns nil, or it reaches the timeout and returns an error.
-func (r *Runtime) WaitContainerStateStopped(ctx context.Context, c *Container) (err error) {
+func (r *Runtime) WaitContainerStateStopped(ctx context.Context, c *Container) error {
 	impl, err := r.RuntimeImpl(c)
 	if err != nil {
 		return err
@@ -122,14 +113,6 @@ func (r *Runtime) WaitContainerStateStopped(ctx context.Context, c *Container) (
 	// is already in the expected status.
 	if c.State().Status == ContainerStateStopped {
 		return nil
-	}
-
-	// We need to ensure the container termination will be properly waited
-	// for by defining a minimal timeout value. This will prevent timeout
-	// value defined in the configuration file to be too low.
-	timeout := r.config.CtrStopTimeout
-	if timeout < minCtrStopTimeout {
-		timeout = minCtrStopTimeout
 	}
 
 	done := make(chan error)
@@ -143,11 +126,10 @@ func (r *Runtime) WaitContainerStateStopped(ctx context.Context, c *Container) (
 				// Check if the container is stopped
 				if err := impl.UpdateContainerStatus(c); err != nil {
 					done <- err
-					close(done)
 					return
 				}
 				if c.State().Status == ContainerStateStopped {
-					close(done)
+					done <- nil
 					return
 				}
 				time.Sleep(100 * time.Millisecond)
@@ -156,13 +138,19 @@ func (r *Runtime) WaitContainerStateStopped(ctx context.Context, c *Container) (
 	}()
 	select {
 	case err = <-done:
+		close(done)
 		break
 	case <-ctx.Done():
 		close(chControl)
+		close(done)
 		return ctx.Err()
-	case <-time.After(time.Duration(timeout) * time.Second):
+	case <-time.After(time.Duration(r.config.CtrStopTimeout) * time.Second):
 		close(chControl)
-		return fmt.Errorf("failed to get container stopped status: %ds timeout reached", timeout)
+		close(done)
+		return fmt.Errorf(
+			"failed to get container stopped status: %ds timeout reached",
+			r.config.CtrStopTimeout,
+		)
 	}
 
 	if err != nil {
@@ -309,17 +297,23 @@ func (r *Runtime) StopContainer(ctx context.Context, c *Container, timeout int64
 }
 
 // DeleteContainer deletes a container.
-func (r *Runtime) DeleteContainer(c *Container) error {
-	impl, err := r.RuntimeImpl(c)
-	if err != nil {
-		return err
+func (r *Runtime) DeleteContainer(c *Container) (err error) {
+	r.runtimeImplMapMutex.RLock()
+	impl, ok := r.runtimeImplMap[c.ID()]
+	r.runtimeImplMapMutex.RUnlock()
+	if !ok {
+		if impl, err = r.newRuntimeImpl(c); err != nil {
+			return err
+		}
+	} else {
+		defer func() {
+			if err == nil {
+				r.runtimeImplMapMutex.Lock()
+				delete(r.runtimeImplMap, c.ID())
+				r.runtimeImplMapMutex.Unlock()
+			}
+		}()
 	}
-
-	defer func() {
-		r.runtimeImplMapMutex.Lock()
-		delete(r.runtimeImplMap, c.ID())
-		r.runtimeImplMapMutex.Unlock()
-	}()
 
 	return impl.DeleteContainer(c)
 }
@@ -355,13 +349,13 @@ func (r *Runtime) UnpauseContainer(c *Container) error {
 }
 
 // ContainerStats provides statistics of a container.
-func (r *Runtime) ContainerStats(c *Container) (*ContainerStats, error) {
+func (r *Runtime) ContainerStats(c *Container, cgroup string) (*ContainerStats, error) {
 	impl, err := r.RuntimeImpl(c)
 	if err != nil {
 		return nil, err
 	}
 
-	return impl.ContainerStats(c)
+	return impl.ContainerStats(c, cgroup)
 }
 
 // SignalContainer sends a signal to a container process.
@@ -385,13 +379,13 @@ func (r *Runtime) AttachContainer(c *Container, inputStream io.Reader, outputStr
 }
 
 // PortForwardContainer forwards the specified port provides statistics of a container.
-func (r *Runtime) PortForwardContainer(c *Container, port int32, stream io.ReadWriter) error {
+func (r *Runtime) PortForwardContainer(ctx context.Context, c *Container, netNsPath string, port int32, stream io.ReadWriteCloser) error {
 	impl, err := r.RuntimeImpl(c)
 	if err != nil {
 		return err
 	}
 
-	return impl.PortForwardContainer(c, port, stream)
+	return impl.PortForwardContainer(ctx, c, netNsPath, port, stream)
 }
 
 // ReopenContainerLog reopens the log file of a container.

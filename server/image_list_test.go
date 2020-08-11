@@ -3,7 +3,7 @@ package server_test
 import (
 	"context"
 
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/cri-o/cri-o/server"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
@@ -30,7 +30,8 @@ var _ = t.Describe("ImageList", func() {
 				imageServerMock.EXPECT().ListImages(
 					gomock.Any(), gomock.Any()).
 					Return([]storage.ImageResult{
-						{ID: imageID, Size: &size, User: "10"}}, nil),
+						{ID: imageID, Size: &size, User: "10"},
+					}, nil),
 			)
 
 			// When
@@ -55,7 +56,8 @@ var _ = t.Describe("ImageList", func() {
 			// When
 			response, err := sut.ListImages(context.Background(),
 				&pb.ListImagesRequest{Filter: &pb.ImageFilter{
-					Image: &pb.ImageSpec{Image: "image"}}})
+					Image: &pb.ImageSpec{Image: "image"},
+				}})
 
 			// Then
 			Expect(err).To(BeNil())
@@ -63,7 +65,7 @@ var _ = t.Describe("ImageList", func() {
 			Expect(len(response.Images)).To(BeEquivalentTo(1))
 		})
 
-		It("should fail when image listing erros", func() {
+		It("should fail when image listing errors", func() {
 			// Given
 			gomock.InOrder(
 				imageServerMock.EXPECT().ListImages(gomock.Any(),

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Versions to be used
+declare -A VERSIONS=(
+    ["cni-plugins"]=v0.8.6
+    ["conmon"]=v2.0.17
+    ["cri-tools"]=v1.18.0
+    ["runc"]=v1.0.0-rc91
+    ["crun"]=0.14.1
+    ["bats"]=v1.2.1
+)
+export VERSIONS

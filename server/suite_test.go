@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containers/image/v5/types"
 	cstorage "github.com/containers/storage"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/oci"
@@ -27,8 +26,8 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/kubernetes/pkg/kubelet/cri/streaming"
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
-	"k8s.io/kubernetes/pkg/kubelet/server/streaming"
 )
 
 // TestServer runs the created specs
@@ -128,7 +127,7 @@ var beforeEach = func() {
 		},
 		"linux": {
 			"namespaces": [
-				{"type": "network", "path": "default"}
+				{"type": "network", "path": "/proc/self/ns/net"}
 			]
 		},
 		"process": {
@@ -156,14 +155,14 @@ var beforeEach = func() {
 	testSandbox, err = sandbox.New(sandboxID, "", "", "", "",
 		make(map[string]string), make(map[string]string), "", "",
 		&pb.PodSandboxMetadata{}, "", "", false, "", "", "",
-		[]*hostport.PortMapping{}, false)
+		[]*hostport.PortMapping{}, false, time.Now())
 	Expect(err).To(BeNil())
 
-	testContainer, err = oci.NewContainer(containerID, "", "", "", "",
+	testContainer, err = oci.NewContainer(containerID, "", "", "",
 		make(map[string]string), make(map[string]string),
-		make(map[string]string), "", "", "",
+		make(map[string]string), "pauseImage", "", "",
 		&pb.ContainerMetadata{}, sandboxID, false, false,
-		false, false, "", "", time.Now(), "")
+		false, "", "", time.Now(), "")
 	Expect(err).To(BeNil())
 
 	// Initialize test streaming server
@@ -182,20 +181,16 @@ var afterEach = func() {
 }
 
 var setupSUT = func() {
-	setupSUTWithContext(nil)
-}
-
-var setupSUTWithContext = func(ctx *types.SystemContext) {
 	var err error
 	mockNewServer()
-	sut, err = server.New(context.Background(), ctx, "", libMock)
+	sut, err = server.New(context.Background(), libMock)
 	Expect(err).To(BeNil())
 	Expect(sut).NotTo(BeNil())
 
 	// Inject the mock
 	sut.SetStorageImageServer(imageServerMock)
 	sut.SetStorageRuntimeServer(runtimeServerMock)
-	Expect(sut.SetNetPlugin(cniPluginMock)).To(BeNil())
+	Expect(sut.SetCNIPlugin(cniPluginMock)).To(BeNil())
 }
 
 func mockNewServer() {
@@ -229,7 +224,7 @@ var mockDirs = func(manifest []byte) {
 }
 
 func createDummyState() {
-	Expect(ioutil.WriteFile("state.json", []byte(`{}`), 0644)).To(BeNil())
+	Expect(ioutil.WriteFile("state.json", []byte(`{}`), 0o644)).To(BeNil())
 }
 
 func mockRuncInLibConfig() {
